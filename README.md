@@ -2,8 +2,8 @@
 
 一款简洁高效的 Android 铃声制作工具，支持音频提取、剪辑、导出和设为铃声。
 
-![主界面](screenshots/home_screen.jpg)
-![剪辑界面](screenshots/editor_screen.jpg)
+<img src="screenshots/home_screen.jpg" width="400">
+<img src="screenshots/editor_screen.jpg" width="400">
 
 ## 功能特点
 
