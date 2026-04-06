@@ -1,9 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
-import 'package:open_file/open_file.dart';
-import 'package:share_plus/share_plus.dart';
 import '../services/audio_service.dart';
 import '../services/ringtone_service.dart';
+import 'history_page.dart';
 
 class EditorPage extends StatefulWidget {
   final String filePath;
@@ -277,6 +276,7 @@ class _EditorPageState extends State<EditorPage> {
 
       await showDialog(
         context: context,
+        barrierDismissible: false,
         builder: (context) => AlertDialog(
           title: Row(
             children: [
@@ -289,7 +289,10 @@ class _EditorPageState extends State<EditorPage> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('铃声已保存到下载文件夹'),
+              Text(
+                '保存位置: /Download/RingtoneMaker/',
+                style: TextStyle(fontSize: 13),
+              ),
               SizedBox(height: 8),
               Text(
                 '文件名: ${outputPath.split('/').last}',
@@ -305,27 +308,15 @@ class _EditorPageState extends State<EditorPage> {
             FilledButton.icon(
               onPressed: () {
                 Navigator.pop(context);
-                OpenFile.open(outputPath);
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => HistoryPage(autoplayPath: outputPath),
+                  ),
+                );
               },
-              icon: Icon(Icons.open_in_new),
-              label: Text('打开'),
-            ),
-            FilledButton.icon(
-              onPressed: () {
-                Navigator.pop(context);
-                Share.shareXFiles([XFile(outputPath)], text: '铃声');
-              },
-              icon: Icon(Icons.share),
-              label: Text('分享'),
-            ),
-            FilledButton.icon(
-              onPressed: () {
-                Navigator.pop(context);
-                _showRingtoneTypeDialog(outputPath);
-              },
-              icon: Icon(Icons.notifications_active),
-              label: Text('设为铃声'),
-              style: FilledButton.styleFrom(backgroundColor: Colors.orange),
+              icon: Icon(Icons.visibility),
+              label: Text('查看'),
             ),
           ],
         ),

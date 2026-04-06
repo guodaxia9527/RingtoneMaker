@@ -7,7 +7,9 @@ import '../services/audio_service.dart';
 import '../services/ringtone_service.dart';
 
 class HistoryPage extends StatefulWidget {
-  const HistoryPage({super.key});
+  final String? autoplayPath;
+
+  const HistoryPage({super.key, this.autoplayPath});
 
   @override
   State<HistoryPage> createState() => _HistoryPageState();
@@ -21,11 +23,19 @@ class _HistoryPageState extends State<HistoryPage> {
   List<RingtoneFile> _ringtones = [];
   bool _isLoading = true;
   String? _currentlyPlayingPath;
+  final ScrollController _scrollController = ScrollController();
 
   @override
   void initState() {
     super.initState();
     _loadRingtones();
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    _audioPlayer.dispose();
+    super.dispose();
   }
 
   Future<void> _loadRingtones() async {
@@ -319,12 +329,6 @@ class _HistoryPageState extends State<HistoryPage> {
     final minutes = twoDigits(duration.inMinutes.remainder(60));
     final seconds = twoDigits(duration.inSeconds.remainder(60));
     return '$minutes:$seconds';
-  }
-
-  @override
-  void dispose() {
-    _audioPlayer.dispose();
-    super.dispose();
   }
 
   @override
