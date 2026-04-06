@@ -18,6 +18,7 @@ class _HistoryPageState extends State<HistoryPage> {
 
   List<RingtoneFile> _ringtones = [];
   bool _isLoading = true;
+  String? _currentlyPlayingPath;
 
   @override
   void initState() {
@@ -79,9 +80,7 @@ class _HistoryPageState extends State<HistoryPage> {
   }
 
   Future<void> _togglePlay(String path) async {
-    final currentPath = _audioPlayer.sequence?.firstOrNull?.tag as String?;
-
-    if (currentPath == path) {
+    if (_currentlyPlayingPath == path) {
       // 当前正在播放这个文件，切换暂停/播放
       if (_audioPlayer.playing) {
         await _audioPlayer.pause();
@@ -92,6 +91,9 @@ class _HistoryPageState extends State<HistoryPage> {
       // 切换到新文件
       await _audioPlayer.stop();
       await _audioPlayer.setFilePath(path);
+      setState(() {
+        _currentlyPlayingPath = path;
+      });
       await _audioPlayer.play();
     }
   }
@@ -114,10 +116,11 @@ class _HistoryPageState extends State<HistoryPage> {
   }
 
   Future<void> _deleteFile(RingtoneFile ringtone) async {
-    final currentPath = _audioPlayer.sequence?.firstOrNull?.tag as String?;
-
-    if (currentPath == ringtone.path) {
+    if (_currentlyPlayingPath == ringtone.path) {
       await _audioPlayer.stop();
+      setState(() {
+        _currentlyPlayingPath = null;
+      });
     }
 
     try {
@@ -201,9 +204,8 @@ class _HistoryPageState extends State<HistoryPage> {
                     stream: _audioPlayer.playerStateStream,
                     builder: (context, stateSnapshot) {
                       final isPlaying = stateSnapshot.data?.playing ?? false;
-                      final currentPath =
-                          _audioPlayer.sequence?.firstOrNull?.tag as String?;
-                      final isCurrentFile = currentPath == ringtone.path;
+                      final isCurrentFile =
+                          _currentlyPlayingPath == ringtone.path;
 
                       return StreamBuilder<Duration>(
                         stream: _audioPlayer.positionStream,
