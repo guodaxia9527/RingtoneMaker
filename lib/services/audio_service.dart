@@ -22,23 +22,23 @@ class AudioService {
   }
 
   /// 创建铃声 - 剪辑指定时间段
-  /// 保存到公共 Download 目录，方便用户查找
+  /// 保存到专用目录，方便用户查找
   Future<String> createRingtone(
     String audioPath,
     Duration startTime,
     Duration endTime,
   ) async {
-    // 使用公共 Download 目录
-    final downloadDir = Directory('/storage/emulated/0/Download');
+    // 使用专用文件夹 RingtoneMaker
+    final appDir = Directory('/storage/emulated/0/Download/RingtoneMaker');
 
-    // 确保 Download 目录存在
-    if (!await downloadDir.exists()) {
-      await downloadDir.create(recursive: true);
+    // 确保目录存在（首次使用时创建）
+    if (!await appDir.exists()) {
+      await appDir.create(recursive: true);
     }
 
     final timestamp = DateTime.now().millisecondsSinceEpoch;
     final fileName = '铃声_$timestamp.m4a';
-    final outputPath = '${downloadDir.path}/$fileName';
+    final outputPath = '${appDir.path}/$fileName';
 
     // 使用 trimAudio 剪辑指定范围，输出为 M4A
     final result = await AudioDecoder.trimAudio(

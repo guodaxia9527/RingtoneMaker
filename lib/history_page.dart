@@ -4,6 +4,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:open_file/open_file.dart';
 import 'package:share_plus/share_plus.dart';
 import '../services/audio_service.dart';
+import '../services/ringtone_service.dart';
 
 class HistoryPage extends StatefulWidget {
   const HistoryPage({super.key});
@@ -15,6 +16,7 @@ class HistoryPage extends StatefulWidget {
 class _HistoryPageState extends State<HistoryPage> {
   final AudioService _audioService = AudioService();
   final AudioPlayer _audioPlayer = AudioPlayer();
+  final RingtoneService _ringtoneService = RingtoneService();
 
   List<RingtoneFile> _ringtones = [];
   bool _isLoading = true;
@@ -30,7 +32,10 @@ class _HistoryPageState extends State<HistoryPage> {
     setState(() => _isLoading = true);
 
     try {
-      final downloadDir = Directory('/storage/emulated/0/Download');
+      // 扫描专用文件夹
+      final downloadDir = Directory(
+        '/storage/emulated/0/Download/RingtoneMaker',
+      );
       if (!await downloadDir.exists()) {
         setState(() {
           _ringtones = [];
@@ -42,7 +47,7 @@ class _HistoryPageState extends State<HistoryPage> {
       final files = await downloadDir.list().toList();
       final m4aFiles = files
           .whereType<File>()
-          .where((f) => f.path.endsWith('.m4a') && f.path.contains('铃声_'))
+          .where((f) => f.path.endsWith('.m4a'))
           .toList();
 
       final ringtones = <RingtoneFile>[];
@@ -113,6 +118,171 @@ class _HistoryPageState extends State<HistoryPage> {
 
   Future<void> _shareFile(String path) async {
     await Share.shareXFiles([XFile(path)], text: '铃声');
+  }
+
+  Future<void> _renameFile(RingtoneFile ringtone) async {
+    final controller = TextEditingController(
+      text: ringtone.name.replaceAll('.m4a', ''),
+    );
+
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('重命名铃声'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '文件名',
+            suffixText: '.m4a',
+          ),
+          maxLength: 50,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+
+    if (newName != null &&
+        newName.isNotEmpty &&
+        newName != ringtone.name.replaceAll('.m4a', '')) {
+      try {
+        final oldFile = File(ringtone.path);
+        final directory = oldFile.parent.path;
+        String finalName = newName;
+        // 过滤非法字符
+        finalName = finalName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+        if (!finalName.endsWith('.m4a')) {
+          finalName = '$finalName.m4a';
+        }
+
+        final newPath = '$directory/$finalName';
+        await oldFile.rename(newPath);
+
+        // 如果正在播放这个文件，更新路径
+        if (_currentlyPlayingPath == ringtone.path) {
+          setState(() {
+            _currentlyPlayingPath = newPath;
+          });
+        }
+
+        _loadRingtones();
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('重命名成功')));
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('重命名失败: $e')));
+        }
+      }
+    }
+  }
+
+  Future<void> _showRingtoneTypeDialog(RingtoneFile ringtone) async {
+    final result = await showDialog<RingtoneType>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('选择铃声类型'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, RingtoneType.ringtone),
+            child: Row(
+              children: [
+                Icon(Icons.phone, color: Colors.green),
+                SizedBox(width: 16),
+                Text('来电铃声'),
+              ],
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, RingtoneType.alarm),
+            child: Row(
+              children: [
+                Icon(Icons.alarm, color: Colors.orange),
+                SizedBox(width: 16),
+                Text('闹钟铃声'),
+              ],
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, RingtoneType.notification),
+            child: Row(
+              children: [
+                Icon(Icons.notifications, color: Colors.blue),
+                SizedBox(width: 16),
+                Text('通知铃声'),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null) {
+      await _setAsRingtone(ringtone.path, result);
+    }
+  }
+
+  Future<void> _setAsRingtone(String filePath, RingtoneType type) async {
+    try {
+      final hasPermission = await _ringtoneService.hasWriteSettingsPermission();
+
+      if (!hasPermission) {
+        await _ringtoneService.requestWriteSettingsPermission();
+
+        bool permissionGranted = false;
+        for (int i = 0; i < 30; i++) {
+          await Future.delayed(Duration(milliseconds: 500));
+          permissionGranted = await _ringtoneService
+              .hasWriteSettingsPermission();
+          if (permissionGranted) break;
+        }
+
+        if (!permissionGranted) {
+          if (mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text('需要授予修改系统设置的权限')));
+          }
+          return;
+        }
+      }
+
+      final success = await _ringtoneService.setAsRingtone(filePath, type);
+
+      if (mounted) {
+        if (success) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('已设为${_ringtoneService.getRingtoneTypeName(type)}'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        } else {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('设置铃声失败')));
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('设置铃声失败: $e')));
+      }
+    }
   }
 
   Future<void> _deleteFile(RingtoneFile ringtone) async {
@@ -228,16 +398,15 @@ class _HistoryPageState extends State<HistoryPage> {
                                         CrossAxisAlignment.start,
                                     children: [
                                       // 文件名和播放按钮
-                                      InkWell(
-                                        onTap: () => _togglePlay(ringtone.path),
-                                        borderRadius: BorderRadius.circular(8),
-                                        child: Padding(
-                                          padding: const EdgeInsets.symmetric(
-                                            vertical: 4,
-                                          ),
-                                          child: Row(
-                                            children: [
-                                              Icon(
+                                      Row(
+                                        children: [
+                                          // 播放图标
+                                          GestureDetector(
+                                            onTap: () =>
+                                                _togglePlay(ringtone.path),
+                                            child: Padding(
+                                              padding: const EdgeInsets.all(4),
+                                              child: Icon(
                                                 isCurrentFile && isPlaying
                                                     ? Icons.pause_circle
                                                     : Icons.play_circle_outline,
@@ -248,23 +417,65 @@ class _HistoryPageState extends State<HistoryPage> {
                                                       ).colorScheme.primary,
                                                 size: 28,
                                               ),
-                                              const SizedBox(width: 12),
-                                              Expanded(
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          // 文件名（点击播放，长按更名）
+                                          Expanded(
+                                            child: GestureDetector(
+                                              onTap: () =>
+                                                  _togglePlay(ringtone.path),
+                                              onLongPress: () =>
+                                                  _renameFile(ringtone),
+                                              child: Container(
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                      vertical: 4,
+                                                    ),
                                                 child: Column(
                                                   crossAxisAlignment:
                                                       CrossAxisAlignment.start,
                                                   children: [
-                                                    Text(
-                                                      ringtone.name,
-                                                      style: TextStyle(
-                                                        fontWeight:
-                                                            FontWeight.w500,
-                                                        color: isCurrentFile
-                                                            ? Colors.green
-                                                            : null,
-                                                      ),
-                                                      overflow:
-                                                          TextOverflow.ellipsis,
+                                                    Row(
+                                                      children: [
+                                                        Expanded(
+                                                          child: Text(
+                                                            ringtone.name,
+                                                            style: TextStyle(
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .w500,
+                                                              color:
+                                                                  isCurrentFile
+                                                                  ? Colors.green
+                                                                  : null,
+                                                            ),
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis,
+                                                          ),
+                                                        ),
+                                                        // 设为铃声图标
+                                                        GestureDetector(
+                                                          onTap: () =>
+                                                              _showRingtoneTypeDialog(
+                                                                ringtone,
+                                                              ),
+                                                          child: Padding(
+                                                            padding:
+                                                                const EdgeInsets.only(
+                                                                  left: 8,
+                                                                ),
+                                                            child: Icon(
+                                                              Icons
+                                                                  .notifications_active,
+                                                              color:
+                                                                  Colors.orange,
+                                                              size: 20,
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ],
                                                     ),
                                                     const SizedBox(height: 4),
                                                     Row(
@@ -316,9 +527,9 @@ class _HistoryPageState extends State<HistoryPage> {
                                                   ],
                                                 ),
                                               ),
-                                            ],
+                                            ),
                                           ),
-                                        ),
+                                        ],
                                       ),
 
                                       // 当前播放文件的进度条（可拖动）
