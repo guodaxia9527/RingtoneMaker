@@ -6,7 +6,7 @@
     <uses-permission android:name="android.permission.WRITE_SETTINGS"/>
     
     <application
-        android:label="铃声制作"
+        android:label="大侠铃声制作"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:requestLegacyExternalStorage="true">
