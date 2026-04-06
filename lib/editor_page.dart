@@ -3,6 +3,7 @@ import 'package:just_audio/just_audio.dart';
 import 'package:open_file/open_file.dart';
 import 'package:share_plus/share_plus.dart';
 import '../services/audio_service.dart';
+import '../services/ringtone_service.dart';
 
 class EditorPage extends StatefulWidget {
   final String filePath;
@@ -17,6 +18,7 @@ class EditorPage extends StatefulWidget {
 class _EditorPageState extends State<EditorPage> {
   final AudioPlayer _audioPlayer = AudioPlayer();
   final AudioService _audioService = AudioService();
+  final RingtoneService _ringtoneService = RingtoneService();
 
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
@@ -149,6 +151,106 @@ class _EditorPageState extends State<EditorPage> {
     }
   }
 
+  Future<void> _showRingtoneTypeDialog(String filePath) async {
+    final result = await showDialog<RingtoneType>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: Text('选择铃声类型'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, RingtoneType.ringtone),
+            child: Row(
+              children: [
+                Icon(Icons.phone, color: Colors.green),
+                SizedBox(width: 16),
+                Text('来电铃声'),
+              ],
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, RingtoneType.alarm),
+            child: Row(
+              children: [
+                Icon(Icons.alarm, color: Colors.orange),
+                SizedBox(width: 16),
+                Text('闹钟铃声'),
+              ],
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, RingtoneType.notification),
+            child: Row(
+              children: [
+                Icon(Icons.notifications, color: Colors.blue),
+                SizedBox(width: 16),
+                Text('通知铃声'),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (result != null) {
+      await _setAsRingtone(filePath, result);
+    }
+  }
+
+  Future<void> _setAsRingtone(String filePath, RingtoneType type) async {
+    try {
+      final hasPermission = await _ringtoneService.hasWriteSettingsPermission();
+
+      if (!hasPermission) {
+        // 请求权限
+        await _ringtoneService.requestWriteSettingsPermission();
+
+        // 等待用户授权后再次检查
+        // 使用循环检查权限状态
+        bool permissionGranted = false;
+        for (int i = 0; i < 30; i++) {
+          await Future.delayed(Duration(milliseconds: 500));
+          permissionGranted = await _ringtoneService
+              .hasWriteSettingsPermission();
+          if (permissionGranted) break;
+        }
+
+        if (!permissionGranted) {
+          if (mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text('需要授予修改系统设置的权限才能设为铃声')));
+          }
+          return;
+        }
+      }
+
+      final success = await _ringtoneService.setAsRingtone(filePath, type);
+
+      if (mounted) {
+        if (success) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                '已成功设为${_ringtoneService.getRingtoneTypeName(type)}',
+              ),
+              backgroundColor: Colors.green,
+            ),
+          );
+        } else {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('设置铃声失败')));
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('设置铃声失败: $e')));
+      }
+    }
+  }
+
   Future<void> _exportRingtone() async {
     if (_endTime <= _startTime) {
       ScaffoldMessenger.of(
@@ -215,6 +317,15 @@ class _EditorPageState extends State<EditorPage> {
               },
               icon: Icon(Icons.share),
               label: Text('分享'),
+            ),
+            FilledButton.icon(
+              onPressed: () {
+                Navigator.pop(context);
+                _showRingtoneTypeDialog(outputPath);
+              },
+              icon: Icon(Icons.notifications_active),
+              label: Text('设为铃声'),
+              style: FilledButton.styleFrom(backgroundColor: Colors.orange),
             ),
           ],
         ),
