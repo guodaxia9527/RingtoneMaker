@@ -37,7 +37,7 @@ class _EditorPageState extends State<EditorPage> {
   // FIX #3: 防止 durationStream 多次 emit 时重置用户调整过的选区
   bool _durationInitialized = false;
 
-  static const Duration _minRange = Duration(seconds: 6);
+  static const Duration _minRange = Duration(seconds: 3);
 
   @override
   void initState() {
@@ -127,6 +127,12 @@ class _EditorPageState extends State<EditorPage> {
   }
 
   void _onStartChanged(Duration newStart) {
+    // 如果正在播放，先停止
+    if (_isPlaying) {
+      _audioPlayer.pause();
+      setState(() => _isPlaying = false);
+    }
+
     // 应用最小6秒限制
     var clampedStart = newStart;
     if (_endTime - clampedStart < _minRange) {
@@ -145,12 +151,16 @@ class _EditorPageState extends State<EditorPage> {
     });
 
     // 跳转到起点位置
-    if (!_isPlaying) {
-      _audioPlayer.seek(_startTime);
-    }
+    _audioPlayer.seek(_startTime);
   }
 
   void _onEndChanged(Duration newEnd) {
+    // 如果正在播放，先停止
+    if (_isPlaying) {
+      _audioPlayer.pause();
+      setState(() => _isPlaying = false);
+    }
+
     // 应用最小6秒限制
     var clampedEnd = newEnd;
     if (clampedEnd - _startTime < _minRange) {
@@ -172,13 +182,11 @@ class _EditorPageState extends State<EditorPage> {
     });
 
     // 跳转到"终点-6秒"位置
-    if (!_isPlaying) {
-      var seekPosition = _endTime - _minRange;
-      if (seekPosition < _startTime) {
-        seekPosition = _startTime;
-      }
-      _audioPlayer.seek(seekPosition);
+    var seekPosition = _endTime - _minRange;
+    if (seekPosition < _startTime) {
+      seekPosition = _startTime;
     }
+    _audioPlayer.seek(seekPosition);
   }
 
   void _onPositionChanged(Duration newPosition) {
@@ -567,7 +575,7 @@ class _EditorPageState extends State<EditorPage> {
                                     ),
                                     SizedBox(width: 8),
                                     Text(
-                                      '起点: ${_formatSimpleDuration(_startTime)}',
+                                      '起点: ${_formatDuration(_startTime)}',
                                       style: TextStyle(
                                         color: Colors.green,
                                         fontWeight: FontWeight.bold,
@@ -588,7 +596,7 @@ class _EditorPageState extends State<EditorPage> {
                                     ),
                                     SizedBox(width: 8),
                                     Text(
-                                      '终点: ${_formatSimpleDuration(_endTime)}',
+                                      '终点: ${_formatDuration(_endTime)}',
                                       style: TextStyle(
                                         color: Colors.red,
                                         fontWeight: FontWeight.bold,
@@ -871,12 +879,13 @@ class _StartHandleState extends State<_StartHandle> {
   }
 
   void _onDragUpdate(DragUpdateDetails details) {
+    final usableWidth = widget.trackWidth - 40;
+
     setState(() {
       _localPixel += details.delta.dx;
-      // 限制范围：0 到 (终点 - 6秒) 之间
-      final usableWidth = widget.trackWidth - 40;
+      // 限制范围：0 到 (终点 - 3秒) 之间
       final minPixel = 0.0;
-      final maxDuration = widget.endTime - const Duration(seconds: 6);
+      final maxDuration = widget.endTime - const Duration(seconds: 3);
       final maxPixel = CustomAudioTrack.durationToPixel(
         maxDuration,
         widget.duration,
@@ -884,6 +893,17 @@ class _StartHandleState extends State<_StartHandle> {
       );
       _localPixel = _localPixel.clamp(minPixel, maxPixel);
     });
+
+    // 实时更新父组件状态
+    final newMs = CustomAudioTrack.pixelToDurationMs(
+      _localPixel,
+      widget.duration,
+      usableWidth,
+    );
+    final newStart = Duration(
+      milliseconds: newMs.round().clamp(0, widget.duration.inMilliseconds),
+    );
+    widget.onChangeEnd(newStart);
   }
 
   void _onDragEnd(DragEndDetails details) {
@@ -1006,11 +1026,12 @@ class _EndHandleState extends State<_EndHandle> {
   }
 
   void _onDragUpdate(DragUpdateDetails details) {
+    final usableWidth = widget.trackWidth - 40;
+
     setState(() {
       _localPixel += details.delta.dx;
-      // 限制范围：(起点 + 6秒) 到 总时长 之间
-      final usableWidth = widget.trackWidth - 40;
-      final minDuration = widget.startTime + const Duration(seconds: 6);
+      // 限制范围：(起点 + 3秒) 到 总时长 之间
+      final minDuration = widget.startTime + const Duration(seconds: 3);
       final minPixel = CustomAudioTrack.durationToPixel(
         minDuration,
         widget.duration,
@@ -1019,6 +1040,17 @@ class _EndHandleState extends State<_EndHandle> {
       final maxPixel = usableWidth.toDouble();
       _localPixel = _localPixel.clamp(minPixel, maxPixel);
     });
+
+    // 实时更新父组件状态
+    final newMs = CustomAudioTrack.pixelToDurationMs(
+      _localPixel,
+      widget.duration,
+      usableWidth,
+    );
+    final newEnd = Duration(
+      milliseconds: newMs.round().clamp(0, widget.duration.inMilliseconds),
+    );
+    widget.onChangeEnd(newEnd);
   }
 
   void _onDragEnd(DragEndDetails details) {
@@ -1126,7 +1158,6 @@ class _PlayheadHandleState extends State<_PlayheadHandle> {
 
   void _syncFromDuration() {
     final usableWidth = widget.trackWidth - 40;
-    // 限制在选区内
     var clampedPosition = widget.position;
     if (clampedPosition < widget.startTime) clampedPosition = widget.startTime;
     if (clampedPosition > widget.endTime) clampedPosition = widget.endTime;
@@ -1146,10 +1177,10 @@ class _PlayheadHandleState extends State<_PlayheadHandle> {
   }
 
   void _onDragUpdate(DragUpdateDetails details) {
+    final usableWidth = widget.trackWidth - 40;
+
     setState(() {
       _localPixel += details.delta.dx;
-      // 限制在选区内
-      final usableWidth = widget.trackWidth - 40;
       final minPixel = CustomAudioTrack.durationToPixel(
         widget.startTime,
         widget.duration,
@@ -1162,6 +1193,19 @@ class _PlayheadHandleState extends State<_PlayheadHandle> {
       );
       _localPixel = _localPixel.clamp(minPixel, maxPixel);
     });
+
+    // 计算新位置并实时更新父组件状态
+    final newMs = CustomAudioTrack.pixelToDurationMs(
+      _localPixel,
+      widget.duration,
+      usableWidth,
+    );
+    final minMs = widget.startTime.inMilliseconds;
+    final maxMs = widget.endTime.inMilliseconds;
+    final clampedMs = newMs.round().clamp(minMs, maxMs);
+    final newPosition = Duration(milliseconds: clampedMs);
+
+    widget.onChangeEnd(newPosition);
   }
 
   void _onDragEnd(DragEndDetails details) {
@@ -1171,7 +1215,6 @@ class _PlayheadHandleState extends State<_PlayheadHandle> {
       widget.duration,
       usableWidth,
     );
-    // 限制在选区内
     final minMs = widget.startTime.inMilliseconds;
     final maxMs = widget.endTime.inMilliseconds;
     final clampedMs = newMs.round().clamp(minMs, maxMs);
@@ -1187,7 +1230,6 @@ class _PlayheadHandleState extends State<_PlayheadHandle> {
   @override
   Widget build(BuildContext context) {
     final usableWidth = widget.trackWidth - 40;
-    // 限制显示位置在选区内
     var clampedPosition = widget.position;
     if (clampedPosition < widget.startTime) clampedPosition = widget.startTime;
     if (clampedPosition > widget.endTime) clampedPosition = widget.endTime;
@@ -1199,7 +1241,7 @@ class _PlayheadHandleState extends State<_PlayheadHandle> {
             widget.duration,
             usableWidth,
           );
-    final leftPosition = displayPixel + 20 - 15; // +20轨道偏移 -15手柄中心
+    final leftPosition = displayPixel + 20 - 15;
 
     return Positioned(
       left: leftPosition,
