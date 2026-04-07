@@ -1,10 +1,13 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:open_file/open_file.dart';
 import 'package:share_plus/share_plus.dart';
 import '../services/audio_service.dart';
 import '../services/ringtone_service.dart';
+
+const _channel = MethodChannel('com.ringtone.ringtone_maker/ringtone');
 
 class HistoryPage extends StatefulWidget {
   final String? autoplayPath;
@@ -42,43 +45,20 @@ class _HistoryPageState extends State<HistoryPage> {
     setState(() => _isLoading = true);
 
     try {
-      // 扫描专用文件夹
-      final downloadDir = Directory(
-        '/storage/emulated/0/Download/RingtoneMaker',
-      );
-      if (!await downloadDir.exists()) {
-        setState(() {
-          _ringtones = [];
-          _isLoading = false;
-        });
-        return;
-      }
+      // 从 MediaStore 查询铃声
+      final ringtonesInfo = await _audioService.queryRingtones();
 
-      final files = await downloadDir.list().toList();
-      final m4aFiles = files
-          .whereType<File>()
-          .where((f) => f.path.endsWith('.m4a'))
-          .toList();
-
-      final ringtones = <RingtoneFile>[];
-
-      for (final file in m4aFiles) {
-        try {
-          final stat = await file.stat();
-          final info = await _audioService.getAudioInfo(file.path);
-
-          ringtones.add(
-            RingtoneFile(
-              path: file.path,
-              name: file.path.split('/').last,
-              size: stat.size,
-              duration: info?.duration ?? Duration.zero,
+      final ringtones = ringtonesInfo
+          .map(
+            (info) => RingtoneFile(
+              uri: info.uri,
+              path: info.path,
+              name: info.name,
+              size: info.size,
+              duration: Duration(milliseconds: info.duration),
             ),
-          );
-        } catch (e) {
-          // 忽略读取失败的文件
-        }
-      }
+          )
+          .toList();
 
       ringtones.sort((a, b) => b.name.compareTo(a.name));
 
@@ -304,11 +284,22 @@ class _HistoryPageState extends State<HistoryPage> {
     }
 
     try {
-      final file = File(ringtone.path);
-      if (await file.exists()) {
-        await file.delete();
+      final result = await _audioService.deleteRingtone(ringtone.uri);
+
+      if (result) {
+        _loadRingtones();
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('删除成功')));
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('删除失败: 无法删除文件')));
+        }
       }
-      _loadRingtones();
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(
@@ -666,12 +657,14 @@ class _HistoryPageState extends State<HistoryPage> {
 }
 
 class RingtoneFile {
-  final String path;
+  final String uri; // content:// URI for MediaStore
+  final String path; // 实际文件路径
   final String name;
   final int size;
   final Duration duration;
 
   RingtoneFile({
+    required this.uri,
     required this.path,
     required this.name,
     required this.size,
