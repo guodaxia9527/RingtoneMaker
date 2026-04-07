@@ -1,13 +1,12 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:open_file/open_file.dart';
 import 'package:share_plus/share_plus.dart';
 import '../services/audio_service.dart';
 import '../services/ringtone_service.dart';
 
-const _channel = MethodChannel('com.ringtone.ringtone_maker/ringtone');
+// FIX #8: 删除从未使用的顶层 _channel 声明（原来在这里）
 
 class HistoryPage extends StatefulWidget {
   final String? autoplayPath;
@@ -45,7 +44,6 @@ class _HistoryPageState extends State<HistoryPage> {
     setState(() => _isLoading = true);
 
     try {
-      // 从 MediaStore 查询铃声
       final ringtonesInfo = await _audioService.queryRingtones();
 
       final ringtones = ringtonesInfo
@@ -76,14 +74,12 @@ class _HistoryPageState extends State<HistoryPage> {
 
   Future<void> _togglePlay(String path) async {
     if (_currentlyPlayingPath == path) {
-      // 当前正在播放这个文件，切换暂停/播放
       if (_audioPlayer.playing) {
         await _audioPlayer.pause();
       } else {
         await _audioPlayer.play();
       }
     } else {
-      // 切换到新文件
       await _audioPlayer.stop();
       await _audioPlayer.setFilePath(path);
       setState(() {
@@ -164,6 +160,8 @@ class _HistoryPageState extends State<HistoryPage> {
           });
         }
 
+        // NOTE: 仅做文件系统重命名，MediaStore 条目将在下次 _loadRingtones 时刷新。
+        // 如需立即同步 MediaStore 显示名，需通过原生 channel 调用 ContentResolver.update()。
         _loadRingtones();
         if (mounted) {
           ScaffoldMessenger.of(
@@ -364,7 +362,8 @@ class _HistoryPageState extends State<HistoryPage> {
                 itemBuilder: (context, index) {
                   final ringtone = _ringtones[index];
 
-                  // 使用 StreamBuilder 实时监听播放器状态
+                  // FIX #4: 用单层 StreamBuilder 监听播放状态（仅控制图标高亮）
+                  // 进度条单独抽成 _AudioProgressBar，只有当前播放项才订阅 positionStream
                   return StreamBuilder<PlayerState>(
                     stream: _audioPlayer.playerStateStream,
                     builder: (context, stateSnapshot) {
@@ -372,286 +371,257 @@ class _HistoryPageState extends State<HistoryPage> {
                       final isCurrentFile =
                           _currentlyPlayingPath == ringtone.path;
 
-                      return StreamBuilder<Duration>(
-                        stream: _audioPlayer.positionStream,
-                        builder: (context, positionSnapshot) {
-                          final position =
-                              positionSnapshot.data ?? Duration.zero;
-
-                          return StreamBuilder<Duration?>(
-                            stream: _audioPlayer.durationStream,
-                            builder: (context, durationSnapshot) {
-                              final duration =
-                                  durationSnapshot.data ?? ringtone.duration;
-
-                              return Card(
-                                margin: const EdgeInsets.only(bottom: 12),
-                                child: Padding(
-                                  padding: const EdgeInsets.all(16),
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      // 文件名和播放按钮
-                                      Row(
-                                        children: [
-                                          // 播放图标
-                                          GestureDetector(
-                                            onTap: () =>
-                                                _togglePlay(ringtone.path),
-                                            child: Padding(
-                                              padding: const EdgeInsets.all(4),
-                                              child: Icon(
-                                                isCurrentFile && isPlaying
-                                                    ? Icons.pause_circle
-                                                    : Icons.play_circle_outline,
-                                                color: isCurrentFile
-                                                    ? Colors.green
-                                                    : Theme.of(
-                                                        context,
-                                                      ).colorScheme.primary,
-                                                size: 28,
-                                              ),
-                                            ),
-                                          ),
-                                          const SizedBox(width: 8),
-                                          // 文件名（点击播放，长按更名）
-                                          Expanded(
-                                            child: GestureDetector(
-                                              onTap: () =>
-                                                  _togglePlay(ringtone.path),
-                                              onLongPress: () =>
-                                                  _renameFile(ringtone),
-                                              child: Container(
-                                                padding:
-                                                    const EdgeInsets.symmetric(
-                                                      vertical: 4,
-                                                    ),
-                                                child: Column(
-                                                  crossAxisAlignment:
-                                                      CrossAxisAlignment.start,
-                                                  children: [
-                                                    Row(
-                                                      children: [
-                                                        Expanded(
-                                                          child: Text(
-                                                            ringtone.name,
-                                                            style: TextStyle(
-                                                              fontWeight:
-                                                                  FontWeight
-                                                                      .w500,
-                                                              color:
-                                                                  isCurrentFile
-                                                                  ? Colors.green
-                                                                  : null,
-                                                            ),
-                                                            overflow:
-                                                                TextOverflow
-                                                                    .ellipsis,
-                                                          ),
-                                                        ),
-                                                        // 设为铃声图标
-                                                        GestureDetector(
-                                                          onTap: () =>
-                                                              _showRingtoneTypeDialog(
-                                                                ringtone,
-                                                              ),
-                                                          child: Padding(
-                                                            padding:
-                                                                const EdgeInsets.only(
-                                                                  left: 8,
-                                                                ),
-                                                            child: Icon(
-                                                              Icons
-                                                                  .notifications_active,
-                                                              color:
-                                                                  Colors.orange,
-                                                              size: 20,
-                                                            ),
-                                                          ),
-                                                        ),
-                                                      ],
-                                                    ),
-                                                    const SizedBox(height: 4),
-                                                    Row(
-                                                      children: [
-                                                        Icon(
-                                                          Icons.timer_outlined,
-                                                          size: 14,
-                                                          color:
-                                                              Colors.grey[600],
-                                                        ),
-                                                        const SizedBox(
-                                                          width: 4,
-                                                        ),
-                                                        Text(
-                                                          _formatDuration(
-                                                            ringtone.duration,
-                                                          ),
-                                                          style: TextStyle(
-                                                            color: Colors
-                                                                .grey[600],
-                                                            fontSize: 13,
-                                                          ),
-                                                        ),
-                                                        const SizedBox(
-                                                          width: 12,
-                                                        ),
-                                                        Icon(
-                                                          Icons
-                                                              .storage_outlined,
-                                                          size: 14,
-                                                          color:
-                                                              Colors.grey[600],
-                                                        ),
-                                                        const SizedBox(
-                                                          width: 4,
-                                                        ),
-                                                        Text(
-                                                          _formatSize(
-                                                            ringtone.size,
-                                                          ),
-                                                          style: TextStyle(
-                                                            color: Colors
-                                                                .grey[600],
-                                                            fontSize: 13,
-                                                          ),
-                                                        ),
-                                                      ],
-                                                    ),
-                                                  ],
-                                                ),
-                                              ),
-                                            ),
-                                          ),
-                                        ],
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              // 文件名和播放按钮
+                              Row(
+                                children: [
+                                  GestureDetector(
+                                    onTap: () => _togglePlay(ringtone.path),
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(4),
+                                      child: Icon(
+                                        isCurrentFile && isPlaying
+                                            ? Icons.pause_circle
+                                            : Icons.play_circle_outline,
+                                        color: isCurrentFile
+                                            ? Colors.green
+                                            : Theme.of(
+                                                context,
+                                              ).colorScheme.primary,
+                                        size: 28,
                                       ),
-
-                                      // 当前播放文件的进度条（可拖动）
-                                      if (isCurrentFile) ...[
-                                        const SizedBox(height: 12),
-                                        Row(
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: GestureDetector(
+                                      onTap: () => _togglePlay(ringtone.path),
+                                      onLongPress: () =>
+                                          _renameFile(ringtone),
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                          vertical: 4,
+                                        ),
+                                        child: Column(
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
                                           children: [
-                                            Text(
-                                              _formatDuration(position),
-                                              style: TextStyle(
-                                                fontSize: 12,
-                                                color: Colors.grey[600],
-                                              ),
-                                            ),
-                                            const SizedBox(width: 8),
-                                            Expanded(
-                                              child: SliderTheme(
-                                                data: SliderTheme.of(context).copyWith(
-                                                  trackHeight: 4,
-                                                  thumbShape:
-                                                      const RoundSliderThumbShape(
-                                                        enabledThumbRadius: 6,
-                                                      ),
-                                                  overlayShape:
-                                                      const RoundSliderOverlayShape(
-                                                        overlayRadius: 12,
-                                                      ),
+                                            Row(
+                                              children: [
+                                                Expanded(
+                                                  child: Text(
+                                                    ringtone.name,
+                                                    style: TextStyle(
+                                                      fontWeight:
+                                                          FontWeight.w500,
+                                                      color: isCurrentFile
+                                                          ? Colors.green
+                                                          : null,
+                                                    ),
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                  ),
                                                 ),
-                                                child: Slider(
-                                                  value: position.inMilliseconds
-                                                      .toDouble()
-                                                      .clamp(
-                                                        0,
-                                                        duration.inMilliseconds
-                                                            .toDouble(),
+                                                GestureDetector(
+                                                  onTap: () =>
+                                                      _showRingtoneTypeDialog(
+                                                        ringtone,
                                                       ),
-                                                  min: 0,
-                                                  max: duration.inMilliseconds
-                                                      .toDouble(),
-                                                  divisions:
-                                                      duration.inMilliseconds >
-                                                          0
-                                                      ? (duration.inMilliseconds ~/
-                                                                100)
-                                                            .clamp(1, 100)
-                                                      : 1,
-                                                  activeColor: Colors.green,
-                                                  inactiveColor:
-                                                      Colors.grey[300],
-                                                  onChanged: (value) {
-                                                    _seekTo(
-                                                      Duration(
-                                                        milliseconds: value
-                                                            .round(),
-                                                      ),
-                                                    );
-                                                  },
+                                                  child: Padding(
+                                                    padding:
+                                                        const EdgeInsets.only(
+                                                          left: 8,
+                                                        ),
+                                                    child: Icon(
+                                                      Icons
+                                                          .notifications_active,
+                                                      color: Colors.orange,
+                                                      size: 20,
+                                                    ),
+                                                  ),
                                                 ),
-                                              ),
+                                              ],
                                             ),
-                                            const SizedBox(width: 8),
-                                            Text(
-                                              _formatDuration(duration),
-                                              style: TextStyle(
-                                                fontSize: 12,
-                                                color: Colors.grey[600],
-                                              ),
+                                            const SizedBox(height: 4),
+                                            Row(
+                                              children: [
+                                                Icon(
+                                                  Icons.timer_outlined,
+                                                  size: 14,
+                                                  color: Colors.grey[600],
+                                                ),
+                                                const SizedBox(width: 4),
+                                                Text(
+                                                  _formatDuration(
+                                                    ringtone.duration,
+                                                  ),
+                                                  style: TextStyle(
+                                                    color: Colors.grey[600],
+                                                    fontSize: 13,
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 12),
+                                                Icon(
+                                                  Icons.storage_outlined,
+                                                  size: 14,
+                                                  color: Colors.grey[600],
+                                                ),
+                                                const SizedBox(width: 4),
+                                                Text(
+                                                  _formatSize(ringtone.size),
+                                                  style: TextStyle(
+                                                    color: Colors.grey[600],
+                                                    fontSize: 13,
+                                                  ),
+                                                ),
+                                              ],
                                             ),
                                           ],
                                         ),
-                                      ],
-
-                                      const SizedBox(height: 8),
-                                      Row(
-                                        mainAxisAlignment:
-                                            MainAxisAlignment.end,
-                                        children: [
-                                          TextButton.icon(
-                                            onPressed: () =>
-                                                _openFile(ringtone.path),
-                                            icon: const Icon(
-                                              Icons.open_in_new,
-                                              size: 18,
-                                            ),
-                                            label: const Text('打开'),
-                                          ),
-                                          const SizedBox(width: 8),
-                                          TextButton.icon(
-                                            onPressed: () =>
-                                                _shareFile(ringtone.path),
-                                            icon: const Icon(
-                                              Icons.share,
-                                              size: 18,
-                                            ),
-                                            label: const Text('分享'),
-                                          ),
-                                          const SizedBox(width: 8),
-                                          TextButton.icon(
-                                            onPressed: () =>
-                                                _deleteFile(ringtone),
-                                            icon: Icon(
-                                              Icons.delete_outline,
-                                              size: 18,
-                                              color: Colors.red[400],
-                                            ),
-                                            label: Text(
-                                              '删除',
-                                              style: TextStyle(
-                                                color: Colors.red[400],
-                                              ),
-                                            ),
-                                          ),
-                                        ],
                                       ),
-                                    ],
+                                    ),
                                   ),
+                                ],
+                              ),
+
+                              // FIX #4: 进度条抽成独立 Widget，只有当前播放项才渲染并订阅 stream
+                              if (isCurrentFile)
+                                _AudioProgressBar(
+                                  audioPlayer: _audioPlayer,
+                                  fallbackDuration: ringtone.duration,
+                                  onSeek: _seekTo,
+                                  formatDuration: _formatDuration,
                                 ),
-                              );
-                            },
-                          );
-                        },
+
+                              const SizedBox(height: 8),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.end,
+                                children: [
+                                  TextButton.icon(
+                                    onPressed: () => _openFile(ringtone.path),
+                                    icon: const Icon(
+                                      Icons.open_in_new,
+                                      size: 18,
+                                    ),
+                                    label: const Text('打开'),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  TextButton.icon(
+                                    onPressed: () => _shareFile(ringtone.path),
+                                    icon: const Icon(Icons.share, size: 18),
+                                    label: const Text('分享'),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  TextButton.icon(
+                                    onPressed: () => _deleteFile(ringtone),
+                                    icon: Icon(
+                                      Icons.delete_outline,
+                                      size: 18,
+                                      color: Colors.red[400],
+                                    ),
+                                    label: Text(
+                                      '删除',
+                                      style: TextStyle(
+                                        color: Colors.red[400],
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
                       );
                     },
                   );
                 },
               ),
             ),
+    );
+  }
+}
+
+/// FIX #4: 独立的进度条 Widget
+/// 只在当前播放的 item 上渲染，避免所有列表项都订阅 positionStream
+class _AudioProgressBar extends StatelessWidget {
+  final AudioPlayer audioPlayer;
+  final Duration fallbackDuration;
+  final ValueChanged<Duration> onSeek;
+  final String Function(Duration) formatDuration;
+
+  const _AudioProgressBar({
+    required this.audioPlayer,
+    required this.fallbackDuration,
+    required this.onSeek,
+    required this.formatDuration,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<Duration>(
+      stream: audioPlayer.positionStream,
+      builder: (context, positionSnapshot) {
+        final position = positionSnapshot.data ?? Duration.zero;
+
+        return StreamBuilder<Duration?>(
+          stream: audioPlayer.durationStream,
+          builder: (context, durationSnapshot) {
+            final duration = durationSnapshot.data ?? fallbackDuration;
+
+            return Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Row(
+                children: [
+                  Text(
+                    formatDuration(position),
+                    style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: SliderTheme(
+                      data: SliderTheme.of(context).copyWith(
+                        trackHeight: 4,
+                        thumbShape: const RoundSliderThumbShape(
+                          enabledThumbRadius: 6,
+                        ),
+                        overlayShape: const RoundSliderOverlayShape(
+                          overlayRadius: 12,
+                        ),
+                      ),
+                      child: Slider(
+                        value: position.inMilliseconds
+                            .toDouble()
+                            .clamp(0, duration.inMilliseconds.toDouble()),
+                        min: 0,
+                        max: duration.inMilliseconds.toDouble(),
+                        divisions: duration.inMilliseconds > 0
+                            ? (duration.inMilliseconds ~/ 100).clamp(1, 100)
+                            : 1,
+                        activeColor: Colors.green,
+                        inactiveColor: Colors.grey[300],
+                        onChanged: (value) {
+                          onSeek(Duration(milliseconds: value.round()));
+                        },
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    formatDuration(duration),
+                    style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
     );
   }
 }

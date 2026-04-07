@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 import '../services/audio_service.dart';
@@ -19,6 +21,9 @@ class _EditorPageState extends State<EditorPage> {
   final AudioService _audioService = AudioService();
   final RingtoneService _ringtoneService = RingtoneService();
 
+  // FIX #2: 保存所有 StreamSubscription，dispose 时统一取消
+  final List<StreamSubscription> _subscriptions = [];
+
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
   Duration _startTime = Duration.zero;
@@ -28,6 +33,9 @@ class _EditorPageState extends State<EditorPage> {
   bool _isLoading = true;
   String? _audioPath;
   String? _errorMessage;
+
+  // FIX #3: 防止 durationStream 多次 emit 时重置用户调整过的选区
+  bool _durationInitialized = false;
 
   static const Duration _minRange = Duration(seconds: 6);
 
@@ -41,6 +49,7 @@ class _EditorPageState extends State<EditorPage> {
     setState(() {
       _isLoading = true;
       _errorMessage = null;
+      _durationInitialized = false;
     });
 
     try {
@@ -53,38 +62,48 @@ class _EditorPageState extends State<EditorPage> {
 
       await _audioPlayer.setFilePath(sourcePath);
 
-      _audioPlayer.durationStream.listen((duration) {
-        if (duration != null && mounted) {
-          setState(() {
-            _duration = duration;
-            _endTime = duration;
-            _startTime = Duration.zero;
-            _isLoading = false;
-          });
-        }
-      });
+      // FIX #2 + FIX #3: 保存订阅；只在首次收到有效时长时初始化选区
+      _subscriptions.add(
+        _audioPlayer.durationStream.listen((duration) {
+          if (duration != null && mounted && !_durationInitialized) {
+            _durationInitialized = true;
+            setState(() {
+              _duration = duration;
+              _endTime = duration;
+              _startTime = Duration.zero;
+              _isLoading = false;
+            });
+          }
+        }),
+      );
 
-      _audioPlayer.positionStream.listen((position) {
-        if (!mounted) return;
+      // FIX #2: 保存订阅
+      _subscriptions.add(
+        _audioPlayer.positionStream.listen((position) {
+          if (!mounted) return;
 
-        // 播放到达终点后停止
-        if (_isPlaying && position >= _endTime) {
-          _audioPlayer.pause();
-          setState(() {
-            _isPlaying = false;
-            _position = _endTime;
-          });
-          return;
-        }
+          // 播放到达终点后停止
+          if (_isPlaying && position >= _endTime) {
+            _audioPlayer.pause();
+            setState(() {
+              _isPlaying = false;
+              _position = _endTime;
+            });
+            return;
+          }
 
-        setState(() => _position = position);
-      });
+          setState(() => _position = position);
+        }),
+      );
 
-      _audioPlayer.playerStateStream.listen((state) {
-        if (mounted) {
-          setState(() => _isPlaying = state.playing);
-        }
-      });
+      // FIX #2: 保存订阅
+      _subscriptions.add(
+        _audioPlayer.playerStateStream.listen((state) {
+          if (mounted) {
+            setState(() => _isPlaying = state.playing);
+          }
+        }),
+      );
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -374,7 +393,20 @@ class _EditorPageState extends State<EditorPage> {
 
   @override
   void dispose() {
+    // FIX #2: 取消所有 Stream 订阅，防止内存泄漏
+    for (final sub in _subscriptions) {
+      sub.cancel();
+    }
     _audioPlayer.dispose();
+
+    // FIX #1: 清理视频提取出的临时音频文件
+    if (_audioPath != null) {
+      final tempFile = File(_audioPath!);
+      tempFile.exists().then((exists) {
+        if (exists) tempFile.delete();
+      });
+    }
+
     super.dispose();
   }
 
