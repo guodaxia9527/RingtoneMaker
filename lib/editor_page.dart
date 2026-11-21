@@ -1,1282 +1,1251 @@
 import 'dart:async';
-import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
-import '../services/audio_service.dart';
-import '../services/ringtone_service.dart';
+import 'audio_timeline.dart';
+import 'edit_selection.dart';
+import 'export_options.dart';
 import 'history_page.dart';
+import 'services/audio_service.dart';
+import 'widgets/recorder_waveforms.dart';
+import 'widgets/tail_filename.dart';
+import 'widgets/recorder_action_icon.dart';
+import 'widgets/saved_ringtone_sheet.dart';
+import 'widgets/boundary_dialog.dart';
+import 'widgets/save_ringtone_dialog.dart';
 
 class EditorPage extends StatefulWidget {
   final String filePath;
+  final String? displayName;
   final bool isVideo;
-
-  const EditorPage({super.key, required this.filePath, required this.isVideo});
-
+  final AudioPlayer? player;
+  const EditorPage({
+    super.key,
+    required this.filePath,
+    required this.isVideo,
+    this.player,
+    this.displayName,
+  });
   @override
   State<EditorPage> createState() => _EditorPageState();
 }
 
-class _EditorPageState extends State<EditorPage> {
-  final AudioPlayer _audioPlayer = AudioPlayer();
-  final AudioService _audioService = AudioService();
-  final RingtoneService _ringtoneService = RingtoneService();
+class _EditSnapshot {
+  final AudioTimeline timeline;
+  final EditSelection selection;
+  final int position;
+  const _EditSnapshot(this.timeline, this.selection, this.position);
+}
 
-  // FIX #2: 保存所有 StreamSubscription，dispose 时统一取消
-  final List<StreamSubscription> _subscriptions = [];
-
-  Duration _duration = Duration.zero;
-  Duration _position = Duration.zero;
-  Duration _startTime = Duration.zero;
-  Duration _endTime = Duration.zero;
-  bool _isPlaying = false;
-  bool _isExporting = false;
-  bool _isLoading = true;
-  String? _audioPath;
-  String? _errorMessage;
-
-  // FIX #3: 防止 durationStream 多次 emit 时重置用户调整过的选区
-  bool _durationInitialized = false;
-
-  static const Duration _minRange = Duration(seconds: 3);
+class _EditorPageState extends State<EditorPage> with WidgetsBindingObserver {
+  late final _player = widget.player ?? AudioPlayer();
+  final _service = AudioService();
+  final _subscriptions = <StreamSubscription<dynamic>>[];
+  final _history = <_EditSnapshot>[];
+  final _redoHistory = <_EditSnapshot>[];
+  late final _requestId = DateTime.now().microsecondsSinceEpoch.toString();
+  AudioTimeline? _timeline, _savedTimeline;
+  int _fadeInMs = 0, _fadeOutMs = 0, _savedFadeInMs = 0, _savedFadeOutMs = 0;
+  String? _exportName;
+  bool _allowPop = false, _leaveDialogOpen = false, _overviewDragging = false;
+  EditSelection? _selection;
+  WaveformData? _waveform;
+  String? _error, _waveError;
+  int _position = 0, _windowMs = 6000;
+  int? _dragOrigin, _playOrigin, _pendingSeek, _overviewReference;
+  bool _wantPlaying = false, _interacting = false, _transition = false;
+  bool _loopSelection = false, _endingPreview = false, _loopRestarting = false;
+  bool _hintRequested = false;
+  bool _positionMenuOpen = false;
+  bool _waveLoading = true, _mediaBusy = false, _exporting = false;
+  Future<void>? _seekTask, _boundaryPauseTask;
+  int _interactionGeneration = 0;
+  int? _activeBoundary;
+  bool get _enabled =>
+      _timeline != null && !_mediaBusy && !_exporting && !_transition;
+  bool get _canMarkPosition =>
+      _enabled && !_wantPlaying && !_player.playing && !_interacting;
 
   @override
   void initState() {
     super.initState();
-    _initAudio();
+    WidgetsBinding.instance.addObserver(this);
+    _subscriptions.add(
+      _player
+          .createPositionStream(
+            minPeriod: const Duration(milliseconds: 16),
+            maxPeriod: const Duration(milliseconds: 16),
+          )
+          .listen(_onPosition),
+    );
+    _subscriptions.add(
+      _player.playerStateStream.listen((state) {
+        if (!mounted || _mediaBusy || _transition || _loopRestarting) return;
+        if (state.processingState == ProcessingState.completed &&
+            !_interacting &&
+            _seekTask == null) {
+          _stopAtEnd();
+        } else if (!state.playing &&
+            _wantPlaying &&
+            !_player.playing &&
+            !_interacting &&
+            _seekTask == null) {
+          setState(() {
+            _wantPlaying = false;
+            _playOrigin = null;
+          });
+        }
+      }),
+    );
+    _subscriptions.add(
+      _player.playbackEventStream.listen(
+        (_) {},
+        onError: (Object error, StackTrace stack) {
+          if (mounted) {
+            setState(() {
+              _wantPlaying = false;
+              _playOrigin = null;
+            });
+            _message('播放失败：$error');
+          }
+        },
+      ),
+    );
+    unawaited(_load());
   }
 
-  Future<void> _initAudio() async {
-    setState(() {
-      _isLoading = true;
-      _errorMessage = null;
-      _durationInitialized = false;
-    });
+  String get _fileName =>
+      widget.displayName ??
+      widget.filePath.replaceAll('\\', '/').split('/').last;
+  Uri get _sourceUri => widget.filePath.startsWith('content://')
+      ? Uri.parse(widget.filePath)
+      : Uri.file(widget.filePath);
 
+  Future<Duration?> _loadOriginal({Duration? initialPosition}) =>
+      widget.filePath.startsWith('content://')
+      ? _player.setAudioSource(
+          AudioSource.uri(_sourceUri),
+          initialPosition: initialPosition,
+        )
+      : _player.setFilePath(widget.filePath, initialPosition: initialPosition);
+
+  Future<void> _loadWaveform() async {
     try {
-      String sourcePath = widget.filePath;
-
-      if (widget.isVideo) {
-        _audioPath = await _audioService.extractAudio(widget.filePath);
-        sourcePath = _audioPath!;
-      }
-
-      await _audioPlayer.setFilePath(sourcePath);
-
-      // FIX #2 + FIX #3: 保存订阅；只在首次收到有效时长时初始化选区
-      _subscriptions.add(
-        _audioPlayer.durationStream.listen((duration) {
-          if (duration != null && mounted && !_durationInitialized) {
-            _durationInitialized = true;
-            setState(() {
-              _duration = duration;
-              _endTime = duration;
-              _startTime = Duration.zero;
-              _isLoading = false;
-            });
-          }
-        }),
+      final waveform = await _service.getWaveform(
+        widget.filePath,
+        _requestId,
+        onProgress: (data) {
+          if (mounted) setState(() => _waveform = data);
+        },
       );
-
-      // FIX #2: 保存订阅
-      _subscriptions.add(
-        _audioPlayer.positionStream.listen((position) {
-          if (!mounted) return;
-
-          // 播放到达终点后停止
-          if (_isPlaying && position >= _endTime) {
-            _audioPlayer.pause();
-            setState(() {
-              _isPlaying = false;
-              _position = _endTime;
-            });
-            return;
-          }
-
-          setState(() => _position = position);
-        }),
-      );
-
-      // FIX #2: 保存订阅
-      _subscriptions.add(
-        _audioPlayer.playerStateStream.listen((state) {
-          if (mounted) {
-            setState(() => _isPlaying = state.playing);
-          }
-        }),
-      );
-    } catch (e) {
       if (mounted) {
         setState(() {
-          _isLoading = false;
-          _errorMessage = e.toString();
+          _waveform = waveform;
+          _waveLoading = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _waveError = '波形暂不可用，仍可拖动时间轴剪辑';
+          _waveLoading = false;
         });
       }
     }
   }
 
-  void _togglePlay() {
-    if (_isPlaying) {
-      _audioPlayer.pause();
-    } else {
-      // 确保播放位置在选区内
-      if (_position < _startTime || _position >= _endTime) {
-        _audioPlayer.seek(_startTime);
-      }
-      _audioPlayer.play();
-    }
-  }
-
-  void _onStartChanged(Duration newStart) {
-    // 如果正在播放，先停止
-    if (_isPlaying) {
-      _audioPlayer.pause();
-      setState(() => _isPlaying = false);
-    }
-
-    // 应用最小6秒限制
-    var clampedStart = newStart;
-    if (_endTime - clampedStart < _minRange) {
-      clampedStart = _endTime - _minRange;
-    }
-    if (clampedStart < Duration.zero) {
-      clampedStart = Duration.zero;
-    }
-
-    setState(() {
-      _startTime = clampedStart;
-      // 如果播放位置在新的起点之前，跳转到起点
-      if (_position < _startTime) {
-        _position = _startTime;
-      }
-    });
-
-    // 跳转到起点位置
-    _audioPlayer.seek(_startTime);
-  }
-
-  void _onEndChanged(Duration newEnd) {
-    // 如果正在播放，先停止
-    if (_isPlaying) {
-      _audioPlayer.pause();
-      setState(() => _isPlaying = false);
-    }
-
-    // 应用最小6秒限制
-    var clampedEnd = newEnd;
-    if (clampedEnd - _startTime < _minRange) {
-      clampedEnd = _startTime + _minRange;
-    }
-    if (clampedEnd > _duration) {
-      clampedEnd = _duration;
-    }
-
-    setState(() {
-      _endTime = clampedEnd;
-      // 如果播放位置在新的终点之后，跳转到"终点-6秒"
-      if (_position > _endTime) {
-        _position = _endTime - _minRange;
-        if (_position < _startTime) {
-          _position = _startTime;
-        }
-      }
-    });
-
-    // 跳转到"终点-6秒"位置
-    var seekPosition = _endTime - _minRange;
-    if (seekPosition < _startTime) {
-      seekPosition = _startTime;
-    }
-    _audioPlayer.seek(seekPosition);
-  }
-
-  void _onPositionChanged(Duration newPosition) {
-    // 限制播放位置在选区内
-    var clampedPosition = newPosition;
-    if (clampedPosition < _startTime) {
-      clampedPosition = _startTime;
-    } else if (clampedPosition > _endTime) {
-      clampedPosition = _endTime;
-    }
-
-    setState(() => _position = clampedPosition);
-    _audioPlayer.seek(clampedPosition);
-  }
-
-  Future<void> _showRingtoneTypeDialog(String filePath) async {
-    final result = await showDialog<RingtoneType>(
-      context: context,
-      builder: (context) => SimpleDialog(
-        title: Text('选择铃声类型'),
-        children: [
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(context, RingtoneType.ringtone),
-            child: Row(
-              children: [
-                Icon(Icons.phone, color: Colors.green),
-                SizedBox(width: 16),
-                Text('来电铃声'),
-              ],
-            ),
-          ),
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(context, RingtoneType.alarm),
-            child: Row(
-              children: [
-                Icon(Icons.alarm, color: Colors.orange),
-                SizedBox(width: 16),
-                Text('闹钟铃声'),
-              ],
-            ),
-          ),
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(context, RingtoneType.notification),
-            child: Row(
-              children: [
-                Icon(Icons.notifications, color: Colors.blue),
-                SizedBox(width: 16),
-                Text('通知铃声'),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-
-    if (result != null) {
-      await _setAsRingtone(filePath, result);
-    }
-  }
-
-  Future<void> _setAsRingtone(String filePath, RingtoneType type) async {
+  Future<void> _load() async {
+    // Player preparation and analysis use independent file descriptors.
+    unawaited(_loadWaveform());
     try {
-      final hasPermission = await _ringtoneService.hasWriteSettingsPermission();
-
-      if (!hasPermission) {
-        await _ringtoneService.requestWriteSettingsPermission();
-
-        bool permissionGranted = false;
-        for (int i = 0; i < 30; i++) {
-          await Future.delayed(Duration(milliseconds: 500));
-          permissionGranted = await _ringtoneService
-              .hasWriteSettingsPermission();
-          if (permissionGranted) break;
-        }
-
-        if (!permissionGranted) {
-          if (mounted) {
-            ScaffoldMessenger.of(
-              context,
-            ).showSnackBar(SnackBar(content: Text('需要授予修改系统设置的权限才能设为铃声')));
-          }
-          return;
-        }
+      final duration = await _loadOriginal();
+      if (!mounted) return;
+      if (duration == null || duration.inMilliseconds <= 0) {
+        throw Exception('文件没有可播放的音轨');
       }
-
-      final success = await _ringtoneService.setAsRingtone(filePath, type);
-
-      if (mounted) {
-        if (success) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('已设为${_ringtoneService.getRingtoneTypeName(type)}'),
-              backgroundColor: Colors.green,
-            ),
-          );
-        } else {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text('设置铃声失败')));
-        }
-      }
+      setState(() {
+        _timeline = AudioTimeline.full(duration.inMilliseconds);
+        _savedTimeline = _timeline;
+        _selection = EditSelection.full(duration.inMilliseconds);
+      });
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('设置铃声失败: $e')));
-      }
+      if (!mounted) return;
+      unawaited(_service.cancelAnalysis(_requestId).catchError((Object _) {}));
+      setState(() => _error = '无法读取音轨，请尝试其他文件。\n$e');
     }
   }
 
-  Future<void> _exportRingtone() async {
-    if (_endTime <= _startTime) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('请确保结束时间晚于起始时间')));
+  void _message(String text) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+    }
+  }
+
+  void _onPosition(Duration value) {
+    if (!mounted ||
+        _timeline == null ||
+        _positionMenuOpen ||
+        _interacting ||
+        _seekTask != null ||
+        _mediaBusy ||
+        _transition ||
+        _loopRestarting) {
       return;
     }
-
-    if (_isPlaying) {
-      await _audioPlayer.pause();
-    }
-
-    setState(() => _isExporting = true);
-
-    try {
-      final outputPath = await _audioService.createRingtone(
-        widget.isVideo ? (_audioPath ?? widget.filePath) : widget.filePath,
-        _startTime,
-        _endTime,
-      );
-
-      if (!mounted) return;
-
-      await showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => AlertDialog(
-          title: Row(
-            children: [
-              Icon(Icons.check_circle, color: Colors.green),
-              SizedBox(width: 8),
-              Text('导出成功'),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                '保存位置: /Download/RingtoneMaker/',
-                style: TextStyle(fontSize: 13),
-              ),
-              SizedBox(height: 8),
-              Text(
-                '文件名: ${outputPath.split('/').last}',
-                style: TextStyle(color: Colors.grey, fontSize: 12),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: Text('关闭'),
-            ),
-            FilledButton.icon(
-              onPressed: () {
-                Navigator.pop(context);
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (context) => HistoryPage(autoplayPath: outputPath),
-                  ),
-                );
-              },
-              icon: Icon(Icons.visibility),
-              label: Text('查看'),
-            ),
-          ],
-        ),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('导出失败: $e')));
-    } finally {
-      if (mounted) setState(() => _isExporting = false);
-    }
-  }
-
-  String _formatDuration(Duration duration) {
-    String twoDigits(int n) => n.toString().padLeft(2, '0');
-    final minutes = twoDigits(duration.inMinutes.remainder(60));
-    final seconds = twoDigits(duration.inSeconds.remainder(60));
-    final milliseconds = twoDigits(
-      duration.inMilliseconds.remainder(1000) ~/ 10,
+    final position = _timeline!.positionOf(
+      _player.currentIndex ?? 0,
+      value.inMilliseconds,
     );
-    return '$minutes:$seconds.$milliseconds';
-  }
-
-  String _formatSimpleDuration(Duration duration) {
-    String twoDigits(int n) => n.toString().padLeft(2, '0');
-    final minutes = twoDigits(duration.inMinutes.remainder(60));
-    final seconds = twoDigits(duration.inSeconds.remainder(60));
-    return '$minutes:$seconds';
-  }
-
-  String _formatRange(Duration start, Duration end) {
-    final diff = end - start;
-    return '${_formatSimpleDuration(start)} - ${_formatSimpleDuration(end)} (${_formatSimpleDuration(diff)})';
-  }
-
-  @override
-  void dispose() {
-    // FIX #2: 取消所有 Stream 订阅，防止内存泄漏
-    for (final sub in _subscriptions) {
-      sub.cancel();
+    if (_wantPlaying && position >= _selection!.endMs) {
+      _stopAtEnd();
+    } else {
+      setState(() => _position = position);
     }
-    _audioPlayer.dispose();
+  }
 
-    // FIX #1: 清理视频提取出的临时音频文件
-    if (_audioPath != null) {
-      final tempFile = File(_audioPath!);
-      tempFile.exists().then((exists) {
-        if (exists) tempFile.delete();
+  void _stopAtEnd() {
+    if (!mounted || !_wantPlaying || _selection == null) return;
+    if (_loopSelection && !_endingPreview) {
+      if (!_loopRestarting) unawaited(_restartLoop());
+      return;
+    }
+    setState(() {
+      _position = _selection!.endMs;
+      _wantPlaying = false;
+      _playOrigin = null;
+      _endingPreview = false;
+    });
+    unawaited(_player.pause().catchError((Object e) => _message('暂停失败：$e')));
+  }
+
+  Future<void> _restartLoop() async {
+    // A loop seek does not change whether the selection can be edited.
+    // Keep its event guard separate from explicit play/pause transitions.
+    _loopRestarting = true;
+    final interaction = _interactionGeneration;
+    try {
+      _seek(_selection!.startMs);
+      await _seekTask;
+      // An edit, pause or waveform gesture takes ownership of playback while
+      // the native seek is pending. Never resume over that newer action.
+      if (!mounted ||
+          !_wantPlaying ||
+          _mediaBusy ||
+          _exporting ||
+          _transition ||
+          _interacting ||
+          interaction != _interactionGeneration) {
+        return;
+      }
+      unawaited(
+        _player.play().catchError((Object error) {
+          if (mounted) {
+            setState(() {
+              _wantPlaying = false;
+              _playOrigin = null;
+            });
+          }
+          _message('试听失败：$error');
+        }),
+      );
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _wantPlaying = false;
+          _playOrigin = null;
+        });
+      }
+      _message('循环试听失败：$error');
+    } finally {
+      _loopRestarting = false;
+    }
+  }
+
+  Future<void> _previewEnding() async {
+    if (!_enabled) return;
+    _endingPreview = true;
+    _seek(
+      math.max(_selection!.startMs, _selection!.endMs - 2000),
+      clearReference: true,
+    );
+    await _seekTask;
+    if (mounted && !_wantPlaying) await _togglePlay(ending: true);
+  }
+
+  Future<void> _adjustBoundary(bool start) async {
+    if (!_enabled) return;
+    setState(() {
+      _wantPlaying = false;
+      _playOrigin = null;
+    });
+    try {
+      await _player.pause();
+    } catch (e) {
+      _message('暂停失败：$e');
+      return;
+    }
+    if (!mounted) return;
+    final value = await showDialog<int>(
+      context: context,
+      builder: (_) => BoundaryDialog(
+        start: start,
+        selection: _selection!,
+        positionMs: _position,
+      ),
+    );
+    if (mounted && value != null) _changeBoundary(value, start);
+  }
+
+  Future<void> _selectionHint() async {
+    if (_hintRequested) return;
+    _hintRequested = true;
+    try {
+      if (await _service.consumeSelectionHint() && mounted) {
+        _message('保留：只留下蓝色选区；移除：删掉蓝色选区。');
+      }
+    } catch (_) {
+      /* The hint must never prevent selection. */
+    }
+  }
+
+  Future<void> _showPositionMenu(Offset globalPosition) async {
+    if (!_enabled || _interacting || _positionMenuOpen) return;
+    // Freeze the visible head as soon as the long press is recognized,
+    // including while waiting for the native player to finish pausing.
+    final position = _position;
+    final selection = _selection!;
+    _positionMenuOpen = true;
+    bool? start;
+    try {
+      if (_wantPlaying || _player.playing) {
+        setState(() {
+          _wantPlaying = false;
+          _playOrigin = null;
+          _endingPreview = false;
+          _transition = true;
+        });
+        try {
+          await _player.pause();
+        } catch (error) {
+          _message('暂停失败：$error');
+          return;
+        } finally {
+          if (mounted) setState(() => _transition = false);
+        }
+      }
+      if (!mounted || !_canMarkPosition) return;
+      final overlay =
+          Overlay.of(context).context.findRenderObject() as RenderBox;
+      final anchor = overlay.globalToLocal(globalPosition);
+      start = await showMenu<bool>(
+        context: context,
+        color: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        position: RelativeRect.fromRect(
+          Rect.fromLTWH(anchor.dx, anchor.dy, 0, 0),
+          Offset.zero & overlay.size,
+        ),
+        items: [
+          PopupMenuItem<bool>(
+            enabled: false,
+            height: 36,
+            child: Text(
+              '当前播放位置 ${displayTime(position, fraction: true)}',
+              style: const TextStyle(fontSize: 12, color: Color(0xFF74777A)),
+            ),
+          ),
+          const PopupMenuDivider(),
+          PopupMenuItem<bool>(
+            key: const ValueKey('mark-position-start'),
+            value: true,
+            enabled:
+                position != selection.startMs &&
+                position <= selection.endMs - selection.minimumMs,
+            child: const Text('设置起点'),
+          ),
+          PopupMenuItem<bool>(
+            key: const ValueKey('mark-position-end'),
+            value: false,
+            enabled:
+                position != selection.endMs &&
+                position >= selection.startMs + selection.minimumMs,
+            child: const Text('设置终点'),
+          ),
+        ],
+      );
+    } finally {
+      _positionMenuOpen = false;
+    }
+    if (!mounted || start == null || !_canMarkPosition) return;
+    final current = _selection!;
+    final next = start
+        ? current.withStart(position)
+        : current.withEnd(position);
+    // Do not silently clamp a marker away from the playhead.
+    if ((start ? next.startMs : next.endMs) == position) {
+      _changeBoundary(position, start);
+    }
+  }
+
+  void _toggleFromWaveform() {
+    if (!_interacting && !_positionMenuOpen) unawaited(_togglePlay());
+  }
+
+  void _beginInteraction() {
+    if (!_enabled) return;
+    _interactionGeneration++;
+    _overviewDragging = false;
+    setState(() {
+      _interacting = true;
+      _dragOrigin = _position;
+      _activeBoundary = null;
+    });
+  }
+
+  void _beginOverviewInteraction() {
+    if (!_enabled) return;
+    _beginInteraction();
+    setState(() {
+      _overviewDragging = true;
+      if (!_wantPlaying) _overviewReference ??= _position;
+      _dragOrigin = _overviewReference ?? _position;
+    });
+  }
+
+  void _beginBoundaryInteraction(int boundary) {
+    _beginInteraction();
+    if (!_interacting) return;
+    setState(() => _activeBoundary = boundary);
+    if (_wantPlaying) {
+      // Keep the playback intent, but silence the actual player until release.
+      _boundaryPauseTask = _player.pause().catchError((Object error) {
+        if (mounted) {
+          setState(() {
+            _wantPlaying = false;
+            _playOrigin = null;
+          });
+        }
+        _message('暂停失败：$error');
       });
     }
-
-    super.dispose();
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final fileName = widget.filePath.split('/').last;
+  void _endInteraction() {
+    if (!mounted) return;
+    final generation = _interactionGeneration;
+    final overview = _overviewDragging;
+    setState(() {
+      _dragOrigin = null;
+      _activeBoundary = null;
+    });
+    unawaited(_finishInteraction(generation, _boundaryPauseTask, overview));
+  }
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('剪辑铃声'),
-        actions: [
-          if (_isExporting)
-            const Center(
-              child: Padding(
-                padding: EdgeInsets.only(right: 16),
-                child: SizedBox(
-                  width: 20,
-                  height: 20,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
+  Future<void> _finishInteraction(
+    int generation,
+    Future<void>? pauseTask,
+    bool overview,
+  ) async {
+    try {
+      await pauseTask;
+      if (!mounted || generation != _interactionGeneration) return;
+      if (_wantPlaying) {
+        final s = _selection!;
+        if (overview && _position >= s.endMs) {
+          setState(() {
+            _wantPlaying = false;
+            _playOrigin = null;
+          });
+          await _player.pause();
+          if (!mounted || generation != _interactionGeneration) return;
+          _seek(s.endMs);
+        } else if (!overview &&
+            (_position >= s.endMs || _position < s.startMs)) {
+          _seek(s.startMs);
+        }
+      }
+      await _seekTask;
+      if (!mounted || generation != _interactionGeneration) return;
+      if (_wantPlaying && !_mediaBusy && !_player.playing) {
+        unawaited(
+          _player.play().catchError((Object error) {
+            if (mounted) {
+              setState(() {
+                _wantPlaying = false;
+                _playOrigin = null;
+              });
+            }
+            _message('播放失败：$error');
+          }),
+        );
+      }
+      setState(() => _interacting = false);
+      _boundaryPauseTask = null;
+    } catch (error) {
+      if (!mounted || generation != _interactionGeneration) return;
+      setState(() {
+        _interacting = false;
+        _wantPlaying = false;
+        _playOrigin = null;
+      });
+      _boundaryPauseTask = null;
+      _message('恢复试听失败：$error');
+    }
+  }
+
+  void _changeBoundary(int time, bool start) {
+    if (!_enabled) return;
+    final s = _selection!;
+    final next = start ? s.withStart(time) : s.withEnd(time);
+    setState(() => _selection = next);
+    if (next.startMs > 0 || next.endMs < next.durationMs) {
+      unawaited(_selectionHint());
+    }
+    if (_activeBoundary == null) {
+      _seek(start ? next.startMs : next.endMs);
+    }
+  }
+
+  void _seek(int position, {bool clearReference = false}) {
+    if (_timeline == null || _mediaBusy || _exporting) return;
+    _pendingSeek = position.clamp(0, _timeline!.durationMs);
+    setState(() {
+      _position = _pendingSeek!;
+      if (clearReference) _overviewReference = null;
+    });
+    _seekTask ??= _drainSeeks();
+  }
+
+  Future<void> _drainSeeks() async {
+    try {
+      while (_pendingSeek != null && mounted) {
+        var target = _pendingSeek!;
+        _pendingSeek = null;
+        if (_wantPlaying && _interacting && target == _timeline!.durationMs) {
+          target = math.max(0, target - 1);
+        }
+        final location = _timeline!.locate(target);
+        // No pause or source reload here: ExoPlayer keeps its playback state.
+        await _player.seek(
+          Duration(milliseconds: location.offsetMs),
+          index: location.index,
+        );
+      }
+    } catch (e) {
+      if (mounted && _loopRestarting) {
+        setState(() {
+          _wantPlaying = false;
+          _playOrigin = null;
+        });
+      }
+      _message('定位失败：$e');
+    } finally {
+      _seekTask = null;
+    }
+  }
+
+  Future<void> _togglePlay({bool ending = false}) async {
+    if (!_enabled) return;
+    setState(() {
+      _transition = true;
+      _endingPreview = ending;
+      if (!_wantPlaying) _overviewReference = null;
+    });
+    try {
+      if (_wantPlaying) {
+        setState(() {
+          _wantPlaying = false;
+          _playOrigin = null;
+        });
+        await _player.pause();
+      } else {
+        final s = _selection!;
+        if (_position < s.startMs || _position >= s.endMs) _seek(s.startMs);
+        await _seekTask;
+        if (!mounted) return;
+        setState(() {
+          _wantPlaying = true;
+          _playOrigin = _position;
+        });
+        unawaited(
+          _player.play().catchError((Object e) {
+            if (mounted) {
+              setState(() {
+                _wantPlaying = false;
+                _playOrigin = null;
+              });
+            }
+            _message('播放失败：$e');
+          }),
+        );
+      }
+    } catch (e) {
+      _message('试听失败：$e');
+    } finally {
+      if (mounted) setState(() => _transition = false);
+    }
+  }
+
+  Future<void> _loadTimeline(AudioTimeline timeline, int position) async {
+    if (timeline.isOriginal) {
+      await _loadOriginal(initialPosition: Duration(milliseconds: position));
+    } else {
+      final location = timeline.locate(position);
+      final source = ConcatenatingAudioSource(
+        useLazyPreparation: false,
+        children: timeline.spans
+            .map(
+              (span) => ClippingAudioSource(
+                child: AudioSource.uri(_sourceUri),
+                start: Duration(milliseconds: span.startMs),
+                end: Duration(milliseconds: span.endMs),
               ),
             )
-          else
-            IconButton(
-              onPressed: _isLoading || _errorMessage != null
-                  ? null
-                  : _exportRingtone,
-              icon: const Icon(Icons.save_alt),
-              tooltip: '导出',
-            ),
-        ],
-      ),
-      body: Column(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(16),
-            color: Theme.of(context).colorScheme.surfaceContainerHighest,
-            child: Row(
-              children: [
-                Icon(
-                  widget.isVideo ? Icons.videocam : Icons.audio_file,
-                  color: Theme.of(context).colorScheme.primary,
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        fileName,
-                        style: Theme.of(context).textTheme.bodyMedium,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      Text(
-                        '总时长: ${_formatSimpleDuration(_duration)}',
-                        style: Theme.of(
-                          context,
-                        ).textTheme.bodySmall?.copyWith(color: Colors.grey),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: _isLoading
-                ? Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        CircularProgressIndicator(),
-                        SizedBox(height: 16),
-                        Text('正在加载音频...'),
-                      ],
-                    ),
-                  )
-                : _errorMessage != null
-                ? Center(
-                    child: Padding(
-                      padding: EdgeInsets.all(24),
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(
-                            Icons.error_outline,
-                            size: 64,
-                            color: Colors.red,
-                          ),
-                          SizedBox(height: 16),
-                          Text(
-                            '加载失败',
-                            style: Theme.of(context).textTheme.titleLarge,
-                          ),
-                          SizedBox(height: 8),
-                          Text(
-                            _errorMessage!,
-                            textAlign: TextAlign.center,
-                            style: TextStyle(color: Colors.grey),
-                          ),
-                          SizedBox(height: 24),
-                          FilledButton(
-                            onPressed: () => Navigator.pop(context),
-                            child: Text('返回'),
-                          ),
-                        ],
-                      ),
-                    ),
-                  )
-                : Padding(
-                    padding: EdgeInsets.all(24),
-                    child: Column(
-                      children: [
-                        Container(
-                          padding: EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 12,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.primaryContainer,
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Text(
-                            '选区: ${_formatRange(_startTime, _endTime)}',
-                            style: Theme.of(context).textTheme.titleMedium,
-                          ),
-                        ),
-                        SizedBox(height: 40),
-                        // 自定义音频轨道
-                        CustomAudioTrack(
-                          duration: _duration,
-                          startTime: _startTime,
-                          endTime: _endTime,
-                          position: _position,
-                          onStartChanged: _onStartChanged,
-                          onEndChanged: _onEndChanged,
-                          onPositionChanged: _onPositionChanged,
-                        ),
-                        SizedBox(height: 24),
-                        // 时间标签
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  children: [
-                                    Container(
-                                      width: 12,
-                                      height: 12,
-                                      decoration: BoxDecoration(
-                                        color: Colors.green,
-                                        shape: BoxShape.circle,
-                                      ),
-                                    ),
-                                    SizedBox(width: 8),
-                                    Text(
-                                      '起点: ${_formatDuration(_startTime)}',
-                                      style: TextStyle(
-                                        color: Colors.green,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                SizedBox(height: 8),
-                                Row(
-                                  children: [
-                                    Container(
-                                      width: 12,
-                                      height: 12,
-                                      decoration: BoxDecoration(
-                                        color: Colors.red,
-                                        shape: BoxShape.circle,
-                                      ),
-                                    ),
-                                    SizedBox(width: 8),
-                                    Text(
-                                      '终点: ${_formatDuration(_endTime)}',
-                                      style: TextStyle(
-                                        color: Colors.red,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              ],
-                            ),
-                            Container(
-                              padding: EdgeInsets.symmetric(
-                                horizontal: 12,
-                                vertical: 6,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.blue.withValues(alpha: 0.1),
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Container(
-                                    width: 10,
-                                    height: 10,
-                                    decoration: BoxDecoration(
-                                      color: Colors.blue,
-                                      shape: BoxShape.circle,
-                                    ),
-                                  ),
-                                  SizedBox(width: 6),
-                                  Text(
-                                    _formatDuration(_position),
-                                    style: TextStyle(
-                                      color: Colors.blue,
-                                      fontWeight: FontWeight.bold,
-                                      fontFamily: 'monospace',
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        ),
-                        Spacer(),
-                        // 播放按钮
-                        GestureDetector(
-                          onTap: _togglePlay,
-                          child: Container(
-                            padding: EdgeInsets.all(20),
-                            decoration: BoxDecoration(
-                              color: _isPlaying ? Colors.orange : Colors.green,
-                              shape: BoxShape.circle,
-                              boxShadow: [
-                                BoxShadow(
-                                  color: Colors.black.withValues(alpha: 0.2),
-                                  blurRadius: 8,
-                                  offset: Offset(0, 4),
-                                ),
-                              ],
-                            ),
-                            child: Icon(
-                              _isPlaying ? Icons.pause : Icons.play_arrow,
-                              color: Colors.white,
-                              size: 48,
-                            ),
-                          ),
-                        ),
-                        Spacer(),
-                      ],
-                    ),
-                  ),
-          ),
-        ],
-      ),
-      bottomNavigationBar: SafeArea(
-        child: Padding(
-          padding: EdgeInsets.all(16),
-          child: FilledButton.icon(
-            onPressed: _isLoading || _errorMessage != null || _isExporting
-                ? null
-                : _exportRingtone,
-            icon: _isExporting
-                ? SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.white,
-                    ),
-                  )
-                : Icon(Icons.save_alt),
-            label: Text(_isExporting ? '导出中...' : '导出铃声'),
-            style: FilledButton.styleFrom(minimumSize: Size.fromHeight(56)),
-          ),
-        ),
-      ),
-    );
+            .toList(),
+      );
+      await _player.setAudioSource(
+        source,
+        initialIndex: location.index,
+        initialPosition: Duration(milliseconds: location.offsetMs),
+      );
+    }
   }
-}
 
-/// 完全自定义的音频轨道组件
-/// 包含：灰色背景轨道、绿色选区高亮、起点/终点手柄、播放头
-/// 每个手柄都是独立的 StatefulWidget，拖动时只更新本地状态，结束后再回调
-class CustomAudioTrack extends StatelessWidget {
-  final Duration duration;
-  final Duration startTime;
-  final Duration endTime;
-  final Duration position;
-  final ValueChanged<Duration> onStartChanged;
-  final ValueChanged<Duration> onEndChanged;
-  final ValueChanged<Duration> onPositionChanged;
-
-  const CustomAudioTrack({
-    super.key,
-    required this.duration,
-    required this.startTime,
-    required this.endTime,
-    required this.position,
-    required this.onStartChanged,
-    required this.onEndChanged,
-    required this.onPositionChanged,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final trackWidth = constraints.maxWidth;
-
-        return Container(
-          height: 80,
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              // 1. 底部灰色轨道（整个音频时长）
-              Positioned(
-                left: 20,
-                right: 20,
-                top: 30,
-                child: Container(
-                  height: 4,
-                  decoration: BoxDecoration(
-                    color: Colors.grey[300],
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
-
-              // 2. 绿色选区高亮（从起点到终点）
-              _buildSelectionHighlight(trackWidth),
-
-              // 3. 绿色起点手柄（左侧）- 独立 StatefulWidget
-              _StartHandle(
-                trackWidth: trackWidth,
-                duration: duration,
-                startTime: startTime,
-                endTime: endTime,
-                onChangeEnd: onStartChanged,
-              ),
-
-              // 4. 红色终点手柄（右侧）- 独立 StatefulWidget
-              _EndHandle(
-                trackWidth: trackWidth,
-                duration: duration,
-                startTime: startTime,
-                endTime: endTime,
-                onChangeEnd: onEndChanged,
-              ),
-
-              // 5. 蓝色播放头（可在选区内拖动）- 独立 StatefulWidget
-              _PlayheadHandle(
-                trackWidth: trackWidth,
-                duration: duration,
-                startTime: startTime,
-                endTime: endTime,
-                position: position,
-                onChangeEnd: onPositionChanged,
-              ),
-            ],
-          ),
-        );
+  Future<void> _edit({required bool remove}) async {
+    if (!_enabled) return;
+    final old = _EditSnapshot(_timeline!, _selection!, _position);
+    final s = old.selection;
+    final next = remove
+        ? old.timeline.remove(s.startMs, s.endMs)
+        : old.timeline.extract(s.startMs, s.endMs);
+    await _apply(
+      next,
+      EditSelection.full(next.durationMs),
+      remove ? math.min(s.startMs, next.durationMs) : 0,
+      onSuccess: () {
+        _history.add(old);
+        _redoHistory.clear();
       },
     );
   }
 
-  /// 构建选区高亮区域
-  Widget _buildSelectionHighlight(double trackWidth) {
-    final usableWidth = trackWidth - 40;
-    final startPx = _durationToPixel(startTime, usableWidth) + 20;
-    final endPx = _durationToPixel(endTime, usableWidth) + 20;
-    final width = endPx - startPx;
+  Future<void> _undo() async {
+    if (!_enabled || _history.isEmpty) return;
+    final old = _history.last;
+    final current = _EditSnapshot(_timeline!, _selection!, _position);
+    await _apply(
+      old.timeline,
+      old.selection,
+      old.position,
+      onSuccess: () {
+        _history.removeLast();
+        _redoHistory.add(current);
+      },
+    );
+  }
 
-    return Positioned(
-      left: startPx,
-      top: 28,
-      child: Container(
-        width: width,
-        height: 8,
-        decoration: BoxDecoration(
-          color: Colors.green.withValues(alpha: 0.3),
-          borderRadius: BorderRadius.circular(4),
+  Future<void> _redo() async {
+    if (!_enabled || _redoHistory.isEmpty) return;
+    final next = _redoHistory.last;
+    final current = _EditSnapshot(_timeline!, _selection!, _position);
+    await _apply(
+      next.timeline,
+      next.selection,
+      next.position,
+      onSuccess: () {
+        _redoHistory.removeLast();
+        _history.add(current);
+      },
+    );
+  }
+
+  Future<void> _apply(
+    AudioTimeline next,
+    EditSelection selection,
+    int position, {
+    required VoidCallback onSuccess,
+  }) async {
+    final old = _EditSnapshot(_timeline!, _selection!, _position);
+    setState(() {
+      _mediaBusy = true;
+      _wantPlaying = false;
+      _playOrigin = null;
+      _dragOrigin = null;
+    });
+    try {
+      await _seekTask;
+      await _player.pause();
+      await _loadTimeline(next, position);
+      if (!mounted) return;
+      setState(() {
+        _timeline = next;
+        _selection = selection;
+        _position = position;
+        _overviewReference = null;
+        _windowMs = _windowMs.clamp(
+          math.min(500, next.durationMs),
+          math.max(6000, next.durationMs * 2),
+        );
+        onSuccess();
+      });
+    } catch (e) {
+      _message('编辑失败，已保留上一步内容：$e');
+      try {
+        await _loadTimeline(old.timeline, old.position);
+      } catch (restoreError) {
+        _message('恢复试听失败，请返回重新打开：$restoreError');
+      }
+    } finally {
+      if (mounted) setState(() => _mediaBusy = false);
+    }
+  }
+
+  bool get _hasUnsavedChanges =>
+      _timeline != null &&
+      _savedTimeline != null &&
+      (!_timeline!.sameContent(_savedTimeline!) ||
+          _fadeInMs != _savedFadeInMs ||
+          _fadeOutMs != _savedFadeOutMs);
+
+  Future<void> _requestLeave() async {
+    if (_exporting || _mediaBusy || _leaveDialogOpen) return;
+    if (_hasUnsavedChanges) {
+      _leaveDialogOpen = true;
+      setState(() {
+        _wantPlaying = false;
+        _playOrigin = null;
+      });
+      try {
+        await _player.pause();
+      } catch (_) {}
+      if (!mounted) return;
+      final discard = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('还有未保存的修改'),
+          content: const Text('离开后，这次剪辑结果将不会保留。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('继续编辑'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              style: TextButton.styleFrom(foregroundColor: editorRed),
+              child: const Text('放弃修改'),
+            ),
+          ],
+        ),
+      );
+      _leaveDialogOpen = false;
+      if (discard != true || !mounted) return;
+    }
+    if (!mounted) return;
+    setState(() => _allowPop = true);
+    await WidgetsBinding.instance.endOfFrame;
+    if (mounted) Navigator.pop(context);
+  }
+
+  Future<void> _save() async {
+    if (!_enabled) return;
+    setState(() {
+      _wantPlaying = false;
+      _playOrigin = null;
+    });
+    try {
+      await _player.pause();
+    } catch (error) {
+      _message('暂停失败：$error');
+      return;
+    }
+    if (!mounted) return;
+    final options = await showDialog<SaveRingtoneOptions>(
+      context: context,
+      builder: (_) => SaveRingtoneDialog(
+        path: widget.filePath,
+        name: _exportName ?? _fileName.replaceFirst(RegExp(r'\.[^.]+$'), ''),
+        timeline: _timeline!,
+        selection: _selection!,
+        fadeInMs: _fadeInMs,
+        fadeOutMs: _fadeOutMs,
+      ),
+    );
+    if (options == null || !mounted) return;
+    final timeline = options.resolve(_timeline!, _selection!);
+    setState(() {
+      _exporting = true;
+      _exportName = options.name;
+      _fadeInMs = options.fadeInMs;
+      _fadeOutMs = options.fadeOutMs;
+    });
+    String? savedUri;
+    try {
+      savedUri = await _service.exportTimeline(
+        widget.filePath,
+        timeline.spans.map((span) => span.toExportRange()).toList(),
+        options.name,
+        fadeInMs: options.fadeInMs,
+        fadeOutMs: options.fadeOutMs,
+      );
+      if (!mounted) return;
+      setState(() {
+        _savedTimeline = _timeline;
+        _savedFadeInMs = options.fadeInMs;
+        _savedFadeOutMs = options.fadeOutMs;
+      });
+    } catch (error) {
+      _message('保存失败，可重试：$error');
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+    if (savedUri == null || !mounted) return;
+    final uri = savedUri;
+    RingtoneInfo? item;
+    try {
+      item = (await _service.queryRingtones()).firstWhere((i) => i.uri == uri);
+    } catch (_) {}
+    if (!mounted) return;
+    final openLibrary = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => SavedRingtoneSheet(
+        uri: uri,
+        name:
+            item?.name ??
+            (options.name.endsWith('.m4a')
+                ? options.name
+                : '${options.name}.m4a'),
+        durationMs: item?.duration ?? timeline.durationMs,
+      ),
+    );
+    if (openLibrary == true && mounted) {
+      await Navigator.push<void>(
+        context,
+        MaterialPageRoute(builder: (_) => HistoryPage(highlightUri: uri)),
+      );
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed && mounted) {
+      setState(() {
+        _wantPlaying = false;
+        _playOrigin = null;
+      });
+      unawaited(_player.pause());
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    for (final subscription in _subscriptions) {
+      unawaited(subscription.cancel());
+    }
+    unawaited(_service.cancelAnalysis(_requestId).catchError((Object _) {}));
+    unawaited(_player.dispose());
+    super.dispose();
+  }
+
+  Widget _action(
+    String label,
+    IconData icon,
+    VoidCallback? action, {
+    bool primary = false,
+  }) {
+    final active = action != null;
+    return Tooltip(
+      message: label == '移除'
+          ? '删除选区并拼接剩余部分'
+          : label == '保留'
+          ? '只保留选区，继续编辑'
+          : label,
+      child: Semantics(
+        label: label,
+        button: true,
+        enabled: active,
+        child: InkWell(
+          onTap: action,
+          borderRadius: BorderRadius.circular(40),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: primary ? 74 : 58,
+                  height: primary ? 74 : 58,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: primary
+                        ? editorGreen
+                        : active
+                        ? Colors.white
+                        : const Color(0xFFE1E3E6),
+                  ),
+                  child: primary
+                      ? Icon(icon, size: 36, color: Colors.white)
+                      : Center(
+                          child: RecorderActionIcon(
+                            extract: label == '保留',
+                            color: active
+                                ? Colors.black
+                                : const Color(0xFF9EA1A5),
+                            background: active
+                                ? Colors.white
+                                : const Color(0xFFE1E3E6),
+                          ),
+                        ),
+                ),
+                if (!primary) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: active ? Colors.black : const Color(0xFFA3A6A9),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
         ),
       ),
     );
   }
 
-  /// 将Duration转换为像素位置
-  static double durationToPixel(
-    Duration d,
-    Duration total,
-    double usableWidth,
-  ) {
-    if (total.inMilliseconds <= 0) return 0;
-    return (d.inMilliseconds / total.inMilliseconds) * usableWidth;
-  }
-
-  /// 将像素偏移转换为毫秒
-  static double pixelToDurationMs(
-    double pixel,
-    Duration total,
-    double usableWidth,
-  ) {
-    if (usableWidth <= 0) return 0;
-    return (pixel / usableWidth) * total.inMilliseconds;
-  }
-
-  double _durationToPixel(Duration d, double usableWidth) {
-    return durationToPixel(d, duration, usableWidth);
-  }
-}
-
-/// 起点手柄 - 独立的 StatefulWidget
-/// 拖动时只更新本地状态，拖动结束后才回调父组件
-class _StartHandle extends StatefulWidget {
-  final double trackWidth;
-  final Duration duration;
-  final Duration startTime;
-  final Duration endTime;
-  final ValueChanged<Duration> onChangeEnd;
-
-  const _StartHandle({
-    required this.trackWidth,
-    required this.duration,
-    required this.startTime,
-    required this.endTime,
-    required this.onChangeEnd,
-  });
-
-  @override
-  State<_StartHandle> createState() => _StartHandleState();
-}
-
-class _StartHandleState extends State<_StartHandle> {
-  double _localPixel = 0;
-  bool _isDragging = false;
-
-  @override
-  void didUpdateWidget(covariant _StartHandle oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    // 非拖动状态下，同步外部位置
-    if (!_isDragging && widget.startTime != oldWidget.startTime) {
-      _syncFromDuration();
-    }
-  }
-
-  void _syncFromDuration() {
-    final usableWidth = widget.trackWidth - 40;
-    _localPixel = CustomAudioTrack.durationToPixel(
-      widget.startTime,
-      widget.duration,
-      usableWidth,
+  Widget _selectionSummary(EditSelection selection) {
+    Widget boundary(bool start) => Expanded(
+      child: TextButton(
+        key: ValueKey(start ? 'adjust-start' : 'adjust-end'),
+        onPressed: _enabled ? () => _adjustBoundary(start) : null,
+        style: TextButton.styleFrom(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          minimumSize: const Size(0, 36),
+          foregroundColor: const Color(0xFF666A6E),
+        ),
+        child: Text(
+          '${start ? '起点' : '终点'} ${displayTime(start ? selection.startMs : selection.endMs, fraction: true)}',
+          style: const TextStyle(
+            fontSize: 12,
+            fontFeatures: [FontFeature.tabularFigures()],
+          ),
+        ),
+      ),
     );
-  }
-
-  void _onDragStart(DragStartDetails details) {
-    _syncFromDuration();
-    setState(() {
-      _isDragging = true;
-    });
-  }
-
-  void _onDragUpdate(DragUpdateDetails details) {
-    final usableWidth = widget.trackWidth - 40;
-
-    setState(() {
-      _localPixel += details.delta.dx;
-      // 限制范围：0 到 (终点 - 3秒) 之间
-      final minPixel = 0.0;
-      final maxDuration = widget.endTime - const Duration(seconds: 3);
-      final maxPixel = CustomAudioTrack.durationToPixel(
-        maxDuration,
-        widget.duration,
-        usableWidth,
-      );
-      _localPixel = _localPixel.clamp(minPixel, maxPixel);
-    });
-
-    // 实时更新父组件状态
-    final newMs = CustomAudioTrack.pixelToDurationMs(
-      _localPixel,
-      widget.duration,
-      usableWidth,
-    );
-    final newStart = Duration(
-      milliseconds: newMs.round().clamp(0, widget.duration.inMilliseconds),
-    );
-    widget.onChangeEnd(newStart);
-  }
-
-  void _onDragEnd(DragEndDetails details) {
-    final usableWidth = widget.trackWidth - 40;
-    final newMs = CustomAudioTrack.pixelToDurationMs(
-      _localPixel,
-      widget.duration,
-      usableWidth,
-    );
-    final newStart = Duration(
-      milliseconds: newMs.round().clamp(0, widget.duration.inMilliseconds),
-    );
-
-    setState(() {
-      _isDragging = false;
-    });
-
-    // 拖动结束后再回调父组件
-    widget.onChangeEnd(newStart);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final usableWidth = widget.trackWidth - 40;
-    // 使用本地位置（拖动中）或计算位置（非拖动中）
-    final displayPixel = _isDragging
-        ? _localPixel
-        : CustomAudioTrack.durationToPixel(
-            widget.startTime,
-            widget.duration,
-            usableWidth,
-          );
-    final leftPosition = displayPixel + 20 - 20; // +20轨道偏移 -20手柄中心
-
-    return Positioned(
-      left: leftPosition,
-      top: 0,
-      child: GestureDetector(
-        onHorizontalDragStart: _onDragStart,
-        onHorizontalDragUpdate: _onDragUpdate,
-        onHorizontalDragEnd: _onDragEnd,
-        child: Container(
-          width: 40,
-          height: 60,
-          color: Colors.transparent,
-          child: Column(
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 20),
+      child: Column(
+        children: [
+          Row(children: [boundary(true), boundary(false)]),
+          Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Container(
-                width: 20,
-                height: 20,
-                decoration: BoxDecoration(
-                  color: Colors.green,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 2),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.3),
-                      blurRadius: 4,
-                      offset: const Offset(0, 2),
-                    ),
-                  ],
+              Flexible(
+                child: Text(
+                  '已选 ${selectionLength(selection.endMs - selection.startMs)}',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: Color(0xFF777A7D),
+                  ),
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
-              Container(width: 2, height: 20, color: Colors.green),
+              const SizedBox(width: 12),
+              IconButton(
+                key: const ValueKey('loop-selection'),
+                tooltip: _loopSelection ? '关闭循环试听' : '循环试听选区',
+                isSelected: _loopSelection,
+                onPressed: _enabled
+                    ? () => setState(() => _loopSelection = !_loopSelection)
+                    : null,
+                icon: Icon(
+                  Icons.repeat_rounded,
+                  size: 20,
+                  color: _loopSelection ? editorBlue : const Color(0xFF777A7D),
+                ),
+                constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+              ),
+              TextButton.icon(
+                key: const ValueKey('audition-ending'),
+                onPressed: _enabled ? _previewEnding : null,
+                icon: const Icon(Icons.last_page_rounded, size: 20),
+                label: const Text('试听结尾', style: TextStyle(fontSize: 12)),
+                style: TextButton.styleFrom(
+                  foregroundColor: const Color(0xFF777A7D),
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                ),
+              ),
             ],
           ),
-        ),
+          const SizedBox(height: 4),
+        ],
       ),
     );
-  }
-}
-
-/// 终点手柄 - 独立的 StatefulWidget
-class _EndHandle extends StatefulWidget {
-  final double trackWidth;
-  final Duration duration;
-  final Duration startTime;
-  final Duration endTime;
-  final ValueChanged<Duration> onChangeEnd;
-
-  const _EndHandle({
-    required this.trackWidth,
-    required this.duration,
-    required this.startTime,
-    required this.endTime,
-    required this.onChangeEnd,
-  });
-
-  @override
-  State<_EndHandle> createState() => _EndHandleState();
-}
-
-class _EndHandleState extends State<_EndHandle> {
-  double _localPixel = 0;
-  bool _isDragging = false;
-
-  @override
-  void didUpdateWidget(covariant _EndHandle oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (!_isDragging && widget.endTime != oldWidget.endTime) {
-      _syncFromDuration();
-    }
-  }
-
-  void _syncFromDuration() {
-    final usableWidth = widget.trackWidth - 40;
-    _localPixel = CustomAudioTrack.durationToPixel(
-      widget.endTime,
-      widget.duration,
-      usableWidth,
-    );
-  }
-
-  void _onDragStart(DragStartDetails details) {
-    _syncFromDuration();
-    setState(() {
-      _isDragging = true;
-    });
-  }
-
-  void _onDragUpdate(DragUpdateDetails details) {
-    final usableWidth = widget.trackWidth - 40;
-
-    setState(() {
-      _localPixel += details.delta.dx;
-      // 限制范围：(起点 + 3秒) 到 总时长 之间
-      final minDuration = widget.startTime + const Duration(seconds: 3);
-      final minPixel = CustomAudioTrack.durationToPixel(
-        minDuration,
-        widget.duration,
-        usableWidth,
-      );
-      final maxPixel = usableWidth.toDouble();
-      _localPixel = _localPixel.clamp(minPixel, maxPixel);
-    });
-
-    // 实时更新父组件状态
-    final newMs = CustomAudioTrack.pixelToDurationMs(
-      _localPixel,
-      widget.duration,
-      usableWidth,
-    );
-    final newEnd = Duration(
-      milliseconds: newMs.round().clamp(0, widget.duration.inMilliseconds),
-    );
-    widget.onChangeEnd(newEnd);
-  }
-
-  void _onDragEnd(DragEndDetails details) {
-    final usableWidth = widget.trackWidth - 40;
-    final newMs = CustomAudioTrack.pixelToDurationMs(
-      _localPixel,
-      widget.duration,
-      usableWidth,
-    );
-    final newEnd = Duration(
-      milliseconds: newMs.round().clamp(0, widget.duration.inMilliseconds),
-    );
-
-    setState(() {
-      _isDragging = false;
-    });
-
-    widget.onChangeEnd(newEnd);
   }
 
   @override
   Widget build(BuildContext context) {
-    final usableWidth = widget.trackWidth - 40;
-    final displayPixel = _isDragging
-        ? _localPixel
-        : CustomAudioTrack.durationToPixel(
-            widget.endTime,
-            widget.duration,
-            usableWidth,
-          );
-    final leftPosition = displayPixel + 20 - 20;
-
-    return Positioned(
-      left: leftPosition,
-      top: 0,
-      child: GestureDetector(
-        onHorizontalDragStart: _onDragStart,
-        onHorizontalDragUpdate: _onDragUpdate,
-        onHorizontalDragEnd: _onDragEnd,
-        child: Container(
-          width: 40,
-          height: 60,
-          color: Colors.transparent,
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Container(
-                width: 20,
-                height: 20,
-                decoration: BoxDecoration(
-                  color: Colors.red,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 2),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.3),
-                      blurRadius: 4,
-                      offset: const Offset(0, 2),
-                    ),
-                  ],
+    final timeline = _timeline, s = _selection;
+    final partial = s != null && (s.startMs > 0 || s.endMs < s.durationMs);
+    final name = _fileName;
+    return PopScope(
+      canPop: !_exporting && !_mediaBusy && (_allowPop || !_hasUnsavedChanges),
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop && !_exporting && !_mediaBusy) unawaited(_requestLeave());
+      },
+      child: Scaffold(
+        backgroundColor: editorBackground,
+        appBar: AppBar(
+          backgroundColor: editorBackground,
+          surfaceTintColor: Colors.transparent,
+          leadingWidth: 64,
+          titleSpacing: 4,
+          leading: TextButton(
+            onPressed: _exporting || _mediaBusy ? null : _requestLeave,
+            child: const Text(
+              '取消',
+              style: TextStyle(color: editorGreen, fontSize: 17),
+            ),
+          ),
+          centerTitle: true,
+          title: const Text(
+            '裁切铃声',
+            style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
+          ),
+          actions: [
+            if (_history.isNotEmpty)
+              IconButton(
+                onPressed: _enabled ? _undo : null,
+                tooltip: '撤销上次编辑',
+                icon: const Icon(Icons.undo, color: editorGreen),
+              ),
+            if (_redoHistory.isNotEmpty)
+              IconButton(
+                onPressed: _enabled ? _redo : null,
+                tooltip: '重做上次编辑',
+                icon: const Icon(Icons.redo, color: editorGreen),
+              ),
+            TextButton(
+              onPressed: _enabled ? _save : null,
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.black,
+                disabledForegroundColor: const Color(0xFFA3A6A9),
+              ),
+              child: const Text('保存', style: TextStyle(fontSize: 17)),
+            ),
+          ],
+        ),
+        body: _error != null
+            ? Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(_error!),
+                ),
+              )
+            : timeline == null || s == null
+            ? const Center(child: CircularProgressIndicator(color: editorGreen))
+            : SafeArea(
+                top: false,
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    final content = Column(
+                      children: [
+                        const SizedBox(height: 24),
+                        Expanded(
+                          flex: 4,
+                          child: DetailWaveform(
+                            timeline: timeline,
+                            peaks: _waveform?.peaks ?? const [],
+                            envelope: _waveform,
+                            startMs: s.startMs,
+                            endMs: s.endMs,
+                            positionMs: _position,
+                            windowMs: _windowMs,
+                            dragOriginMs: _dragOrigin,
+                            playOriginMs: _playOrigin,
+                            activeBoundary: _activeBoundary,
+                            onBoundaryDragStart: _beginBoundaryInteraction,
+                            onPositionMenuRequested: _enabled && !_interacting
+                                ? _showPositionMenu
+                                : null,
+                            onTogglePlayback: _enabled && !_interacting
+                                ? _toggleFromWaveform
+                                : null,
+                            enabled: _enabled,
+                            onStart: (v) => _changeBoundary(v, true),
+                            onEnd: (v) => _changeBoundary(v, false),
+                            onSeek: (v) => _seek(v, clearReference: true),
+                            onZoom: (v) => setState(
+                              () => _windowMs = v.clamp(
+                                math.min(500, timeline.durationMs),
+                                math.max(6000, timeline.durationMs * 2),
+                              ),
+                            ),
+                            onInteractionStart: _beginInteraction,
+                            onInteractionEnd: _endInteraction,
+                          ),
+                        ),
+                        Expanded(
+                          flex: 3,
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 24),
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                FittedBox(
+                                  child: Text(
+                                    displayTime(_position, fraction: true),
+                                    style: const TextStyle(
+                                      fontSize: 54,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.black,
+                                      fontFeatures: [
+                                        FontFeature.tabularFigures(),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                TailFilename(
+                                  name: name,
+                                  style: const TextStyle(
+                                    fontSize: 17,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                if (_waveLoading)
+                                  const Padding(
+                                    padding: EdgeInsets.only(top: 12),
+                                    child: Text(
+                                      '正在生成波形…',
+                                      style: TextStyle(
+                                        color: Colors.grey,
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  ),
+                                if (_waveError != null)
+                                  Text(
+                                    _waveError!,
+                                    style: const TextStyle(
+                                      color: Colors.grey,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        _selectionSummary(s),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16),
+                          child: OverviewWaveform(
+                            timeline: timeline,
+                            peaks: _waveform?.peaks ?? const [],
+                            envelope: _waveform,
+                            startMs: s.startMs,
+                            endMs: s.endMs,
+                            positionMs: _position,
+                            referenceMs: _overviewReference,
+                            playing: _wantPlaying,
+                            enabled: _enabled,
+                            onStart: (v) => _changeBoundary(v, true),
+                            onEnd: (v) => _changeBoundary(v, false),
+                            onInteractionStart: _beginOverviewInteraction,
+                            onInteractionEnd: _endInteraction,
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 3, 16, 16),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                displayTime(_position),
+                                style: const TextStyle(
+                                  color: Color(0xFF777A7D),
+                                  fontSize: 13,
+                                ),
+                              ),
+                              Text(
+                                displayTime(timeline.durationMs),
+                                style: const TextStyle(
+                                  color: Color(0xFF777A7D),
+                                  fontSize: 13,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        SizedBox(
+                          height: 108,
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              _action(
+                                '移除',
+                                Icons.delete_outline,
+                                _enabled && partial
+                                    ? () => _edit(remove: true)
+                                    : null,
+                              ),
+                              _action(
+                                _wantPlaying ? '暂停' : '播放',
+                                _wantPlaying
+                                    ? Icons.pause_rounded
+                                    : Icons.play_arrow_rounded,
+                                _enabled ? _togglePlay : null,
+                                primary: true,
+                              ),
+                              _action(
+                                '保留',
+                                Icons.crop,
+                                _enabled && partial
+                                    ? () => _edit(remove: false)
+                                    : null,
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                    );
+                    return Stack(
+                      children: [
+                        if (constraints.maxHeight < 580)
+                          SingleChildScrollView(
+                            child: SizedBox(height: 660, child: content),
+                          )
+                        else
+                          content,
+                        if (_mediaBusy || _exporting)
+                          Positioned.fill(
+                            child: ColoredBox(
+                              color: editorBackground.withValues(alpha: .85),
+                              child: Center(
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const CircularProgressIndicator(
+                                      color: editorGreen,
+                                    ),
+                                    const SizedBox(height: 16),
+                                    Text(_exporting ? '正在保存…' : '正在更新音频…'),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    );
+                  },
                 ),
               ),
-              Container(width: 2, height: 20, color: Colors.red),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// 播放头手柄 - 独立的 StatefulWidget
-class _PlayheadHandle extends StatefulWidget {
-  final double trackWidth;
-  final Duration duration;
-  final Duration startTime;
-  final Duration endTime;
-  final Duration position;
-  final ValueChanged<Duration> onChangeEnd;
-
-  const _PlayheadHandle({
-    required this.trackWidth,
-    required this.duration,
-    required this.startTime,
-    required this.endTime,
-    required this.position,
-    required this.onChangeEnd,
-  });
-
-  @override
-  State<_PlayheadHandle> createState() => _PlayheadHandleState();
-}
-
-class _PlayheadHandleState extends State<_PlayheadHandle> {
-  double _localPixel = 0;
-  bool _isDragging = false;
-
-  @override
-  void didUpdateWidget(covariant _PlayheadHandle oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (!_isDragging && widget.position != oldWidget.position) {
-      _syncFromDuration();
-    }
-  }
-
-  void _syncFromDuration() {
-    final usableWidth = widget.trackWidth - 40;
-    var clampedPosition = widget.position;
-    if (clampedPosition < widget.startTime) clampedPosition = widget.startTime;
-    if (clampedPosition > widget.endTime) clampedPosition = widget.endTime;
-
-    _localPixel = CustomAudioTrack.durationToPixel(
-      clampedPosition,
-      widget.duration,
-      usableWidth,
-    );
-  }
-
-  void _onDragStart(DragStartDetails details) {
-    _syncFromDuration();
-    setState(() {
-      _isDragging = true;
-    });
-  }
-
-  void _onDragUpdate(DragUpdateDetails details) {
-    final usableWidth = widget.trackWidth - 40;
-
-    setState(() {
-      _localPixel += details.delta.dx;
-      final minPixel = CustomAudioTrack.durationToPixel(
-        widget.startTime,
-        widget.duration,
-        usableWidth,
-      );
-      final maxPixel = CustomAudioTrack.durationToPixel(
-        widget.endTime,
-        widget.duration,
-        usableWidth,
-      );
-      _localPixel = _localPixel.clamp(minPixel, maxPixel);
-    });
-
-    // 计算新位置并实时更新父组件状态
-    final newMs = CustomAudioTrack.pixelToDurationMs(
-      _localPixel,
-      widget.duration,
-      usableWidth,
-    );
-    final minMs = widget.startTime.inMilliseconds;
-    final maxMs = widget.endTime.inMilliseconds;
-    final clampedMs = newMs.round().clamp(minMs, maxMs);
-    final newPosition = Duration(milliseconds: clampedMs);
-
-    widget.onChangeEnd(newPosition);
-  }
-
-  void _onDragEnd(DragEndDetails details) {
-    final usableWidth = widget.trackWidth - 40;
-    final newMs = CustomAudioTrack.pixelToDurationMs(
-      _localPixel,
-      widget.duration,
-      usableWidth,
-    );
-    final minMs = widget.startTime.inMilliseconds;
-    final maxMs = widget.endTime.inMilliseconds;
-    final clampedMs = newMs.round().clamp(minMs, maxMs);
-    final newPosition = Duration(milliseconds: clampedMs);
-
-    setState(() {
-      _isDragging = false;
-    });
-
-    widget.onChangeEnd(newPosition);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final usableWidth = widget.trackWidth - 40;
-    var clampedPosition = widget.position;
-    if (clampedPosition < widget.startTime) clampedPosition = widget.startTime;
-    if (clampedPosition > widget.endTime) clampedPosition = widget.endTime;
-
-    final displayPixel = _isDragging
-        ? _localPixel
-        : CustomAudioTrack.durationToPixel(
-            clampedPosition,
-            widget.duration,
-            usableWidth,
-          );
-    final leftPosition = displayPixel + 20 - 15;
-
-    return Positioned(
-      left: leftPosition,
-      top: 0,
-      child: GestureDetector(
-        onHorizontalDragStart: _onDragStart,
-        onHorizontalDragUpdate: _onDragUpdate,
-        onHorizontalDragEnd: _onDragEnd,
-        child: Container(
-          width: 30,
-          height: 80,
-          color: Colors.transparent,
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.start,
-            children: [
-              Container(
-                width: 16,
-                height: 16,
-                decoration: BoxDecoration(
-                  color: Colors.blue,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 2),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.3),
-                      blurRadius: 4,
-                      offset: const Offset(0, 2),
-                    ),
-                  ],
-                ),
-              ),
-              Container(width: 2, height: 64, color: Colors.blue),
-            ],
-          ),
-        ),
       ),
     );
   }

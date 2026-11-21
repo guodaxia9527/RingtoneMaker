@@ -1,7 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- 背景层 - 透明PNG -->
-    <background android:drawable="@drawable/ic_launcher_background"/>
-    <!-- 前景层 - 剪刀图标（带15%边距） -->
+    <background android:drawable="@android:color/white"/>
     <foreground android:drawable="@drawable/ic_launcher_foreground"/>
 </adaptive-icon>

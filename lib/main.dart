@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'home_page.dart';
+import 'app_theme.dart';
 
 void main() {
   runApp(const RingtoneApp());
@@ -14,10 +14,7 @@ class RingtoneApp extends StatelessWidget {
     return MaterialApp(
       title: '铃声制作',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.orange),
-        useMaterial3: true,
-      ),
+      theme: buildAppTheme(),
       home: const HomePage(),
     );
   }

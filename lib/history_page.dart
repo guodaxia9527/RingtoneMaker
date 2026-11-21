@@ -1,643 +1,410 @@
-import 'dart:io';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
-import 'package:open_file/open_file.dart';
-import 'package:share_plus/share_plus.dart';
-import '../services/audio_service.dart';
-import '../services/ringtone_service.dart';
-
-// FIX #8: 删除从未使用的顶层 _channel 声明（原来在这里）
+import 'app_theme.dart';
+import 'audio_timeline.dart';
+import 'services/audio_service.dart';
+import 'services/ringtone_actions.dart';
+import 'widgets/tail_filename.dart';
 
 class HistoryPage extends StatefulWidget {
-  final String? autoplayPath;
-
-  const HistoryPage({super.key, this.autoplayPath});
-
+  final String? highlightUri;
+  final AudioPlayer? player;
+  const HistoryPage({super.key, this.highlightUri, this.player});
   @override
   State<HistoryPage> createState() => _HistoryPageState();
 }
 
-class _HistoryPageState extends State<HistoryPage> {
-  final AudioService _audioService = AudioService();
-  final AudioPlayer _audioPlayer = AudioPlayer();
-  final RingtoneService _ringtoneService = RingtoneService();
-
-  List<RingtoneFile> _ringtones = [];
-  bool _isLoading = true;
-  String? _currentlyPlayingPath;
-  final ScrollController _scrollController = ScrollController();
+class _HistoryPageState extends State<HistoryPage> with WidgetsBindingObserver {
+  final _service = AudioService();
+  late final _player = widget.player ?? AudioPlayer();
+  late final _actions = RingtoneActions(onMessage: _message)
+    ..addListener(_refresh);
+  List<RingtoneInfo> _items = [];
+  String? _current, _error;
+  bool _loading = true, _localBusy = false;
+  int _loadVersion = 0;
+  StreamSubscription<PlayerState>? _subscription;
+  bool get _busy => _localBusy || _actions.busy;
+  void _refresh() {
+    if (mounted) setState(() {});
+  }
 
   @override
   void initState() {
     super.initState();
-    _loadRingtones();
+    WidgetsBinding.instance.addObserver(this);
+    _subscription = _player.playerStateStream.listen((state) {
+      if (!mounted) return;
+      if (state.processingState == ProcessingState.completed) {
+        unawaited(_player.pause());
+      }
+      setState(() {});
+    });
+    unawaited(_load());
+  }
+
+  void _message(String text) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+    }
+  }
+
+  Future<void> _load() async {
+    if (!mounted) return;
+    final version = ++_loadVersion;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final items = await _service.queryRingtones();
+      if (mounted && version == _loadVersion) {
+        setState(() {
+          _items = items;
+          _loading = false;
+        });
+      }
+    } catch (error) {
+      if (mounted && version == _loadVersion) {
+        setState(() {
+          _loading = false;
+          _error = '读取铃声失败：$error';
+        });
+      }
+    }
+  }
+
+  Future<void> _run(Future<void> Function() action) async {
+    if (_busy || !mounted) return;
+    setState(() => _localBusy = true);
+    try {
+      await action();
+    } catch (error) {
+      _message('操作失败：$error');
+    } finally {
+      if (mounted) setState(() => _localBusy = false);
+    }
+  }
+
+  Future<void> _toggle(String uri) => _run(() async {
+    if (_current == uri && _player.playing) {
+      await _player.pause();
+    } else {
+      if (_current != uri) {
+        await _player.setUrl(uri);
+        if (!mounted) return;
+        setState(() => _current = uri);
+      } else if (_player.processingState == ProcessingState.completed) {
+        await _player.seek(Duration.zero);
+      }
+      if (mounted) {
+        unawaited(_player.play().catchError((Object e) => _message('播放失败：$e')));
+      }
+    }
+  });
+  Future<void> _action(RingtoneInfo item, String action) async {
+    if (_busy) return;
+    if (action == 'ringtone') {
+      await _player.pause();
+      if (!mounted) return;
+      final type = await chooseRingtoneType(context);
+      if (type != null && mounted) await _actions.setAsRingtone(item.uri, type);
+    } else if (action == 'share') {
+      await _player.pause();
+      if (mounted) await _actions.share(item.uri, item.name);
+    } else if (action == 'rename') {
+      final controller = TextEditingController(
+        text: item.name.replaceFirst(RegExp(r'\.m4a$'), ''),
+      );
+      final name = await showDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('重命名'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            maxLength: 60,
+            decoration: const InputDecoration(
+              labelText: '文件名',
+              suffixText: '.m4a',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () {
+                if (controller.text.trim().isNotEmpty) {
+                  Navigator.pop(context, controller.text.trim());
+                }
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      );
+      Future<void>.delayed(
+        const Duration(milliseconds: 400),
+        controller.dispose,
+      );
+      if (name != null && mounted) {
+        await _run(() async {
+          await _service.renameRingtone(item.uri, name);
+          await _load();
+        });
+      }
+    } else if (action == 'delete') {
+      final confirm = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('删除这段铃声？'),
+          content: Text(item.name),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(context, true),
+              style: TextButton.styleFrom(foregroundColor: editorRed),
+              child: const Text('删除'),
+            ),
+          ],
+        ),
+      );
+      if (confirm == true && mounted) {
+        await _run(() async {
+          if (_current == item.uri) {
+            await _player.stop();
+            _current = null;
+          }
+          if (!await _service.deleteRingtone(item.uri)) {
+            throw Exception('文件未删除');
+          }
+          await _load();
+        });
+      }
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) unawaited(_player.pause());
   }
 
   @override
   void dispose() {
-    _scrollController.dispose();
-    _audioPlayer.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    _actions.dispose();
+    unawaited(_subscription?.cancel());
+    unawaited(_player.dispose());
     super.dispose();
   }
 
-  Future<void> _loadRingtones() async {
-    setState(() => _isLoading = true);
-
-    try {
-      final ringtonesInfo = await _audioService.queryRingtones();
-
-      final ringtones = ringtonesInfo
-          .map(
-            (info) => RingtoneFile(
-              uri: info.uri,
-              path: info.path,
-              name: info.name,
-              size: info.size,
-              duration: Duration(milliseconds: info.duration),
-            ),
-          )
-          .toList();
-
-      ringtones.sort((a, b) => b.name.compareTo(a.name));
-
-      setState(() {
-        _ringtones = ringtones;
-        _isLoading = false;
-      });
-    } catch (e) {
-      setState(() {
-        _ringtones = [];
-        _isLoading = false;
-      });
-    }
-  }
-
-  Future<void> _togglePlay(String path) async {
-    if (_currentlyPlayingPath == path) {
-      if (_audioPlayer.playing) {
-        await _audioPlayer.pause();
-      } else {
-        await _audioPlayer.play();
-      }
-    } else {
-      await _audioPlayer.stop();
-      await _audioPlayer.setFilePath(path);
-      setState(() {
-        _currentlyPlayingPath = path;
-      });
-      await _audioPlayer.play();
-    }
-  }
-
-  Future<void> _seekTo(Duration position) async {
-    await _audioPlayer.seek(position);
-  }
-
-  Future<void> _openFile(String path) async {
-    final result = await OpenFile.open(path);
-    if (result.type != ResultType.done && mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('无法打开文件: ${result.message}')));
-    }
-  }
-
-  Future<void> _shareFile(String path) async {
-    await Share.shareXFiles([XFile(path)], text: '铃声');
-  }
-
-  Future<void> _renameFile(RingtoneFile ringtone) async {
-    final controller = TextEditingController(
-      text: ringtone.name.replaceAll('.m4a', ''),
-    );
-
-    final newName = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('重命名铃声'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: '文件名',
-            suffixText: '.m4a',
-          ),
-          maxLength: 50,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('确定'),
-          ),
-        ],
-      ),
-    );
-
-    if (newName != null &&
-        newName.isNotEmpty &&
-        newName != ringtone.name.replaceAll('.m4a', '')) {
-      try {
-        final oldFile = File(ringtone.path);
-        final directory = oldFile.parent.path;
-        String finalName = newName;
-        // 过滤非法字符
-        finalName = finalName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
-        if (!finalName.endsWith('.m4a')) {
-          finalName = '$finalName.m4a';
-        }
-
-        final newPath = '$directory/$finalName';
-        await oldFile.rename(newPath);
-
-        // 如果正在播放这个文件，更新路径
-        if (_currentlyPlayingPath == ringtone.path) {
-          setState(() {
-            _currentlyPlayingPath = newPath;
-          });
-        }
-
-        // NOTE: 仅做文件系统重命名，MediaStore 条目将在下次 _loadRingtones 时刷新。
-        // 如需立即同步 MediaStore 显示名，需通过原生 channel 调用 ContentResolver.update()。
-        _loadRingtones();
-        if (mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text('重命名成功')));
-        }
-      } catch (e) {
-        if (mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text('重命名失败: $e')));
-        }
-      }
-    }
-  }
-
-  Future<void> _showRingtoneTypeDialog(RingtoneFile ringtone) async {
-    final result = await showDialog<RingtoneType>(
-      context: context,
-      builder: (context) => SimpleDialog(
-        title: const Text('选择铃声类型'),
-        children: [
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(context, RingtoneType.ringtone),
-            child: Row(
-              children: [
-                Icon(Icons.phone, color: Colors.green),
-                SizedBox(width: 16),
-                Text('来电铃声'),
-              ],
-            ),
-          ),
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(context, RingtoneType.alarm),
-            child: Row(
-              children: [
-                Icon(Icons.alarm, color: Colors.orange),
-                SizedBox(width: 16),
-                Text('闹钟铃声'),
-              ],
-            ),
-          ),
-          SimpleDialogOption(
-            onPressed: () => Navigator.pop(context, RingtoneType.notification),
-            child: Row(
-              children: [
-                Icon(Icons.notifications, color: Colors.blue),
-                SizedBox(width: 16),
-                Text('通知铃声'),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-
-    if (result != null) {
-      await _setAsRingtone(ringtone.path, result);
-    }
-  }
-
-  Future<void> _setAsRingtone(String filePath, RingtoneType type) async {
-    try {
-      final hasPermission = await _ringtoneService.hasWriteSettingsPermission();
-
-      if (!hasPermission) {
-        await _ringtoneService.requestWriteSettingsPermission();
-
-        bool permissionGranted = false;
-        for (int i = 0; i < 30; i++) {
-          await Future.delayed(Duration(milliseconds: 500));
-          permissionGranted = await _ringtoneService
-              .hasWriteSettingsPermission();
-          if (permissionGranted) break;
-        }
-
-        if (!permissionGranted) {
-          if (mounted) {
-            ScaffoldMessenger.of(
-              context,
-            ).showSnackBar(SnackBar(content: Text('需要授予修改系统设置的权限')));
-          }
-          return;
-        }
-      }
-
-      final success = await _ringtoneService.setAsRingtone(filePath, type);
-
-      if (mounted) {
-        if (success) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('已设为${_ringtoneService.getRingtoneTypeName(type)}'),
-              backgroundColor: Colors.green,
-            ),
-          );
-        } else {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(SnackBar(content: Text('设置铃声失败')));
-        }
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('设置铃声失败: $e')));
-      }
-    }
-  }
-
-  Future<void> _deleteFile(RingtoneFile ringtone) async {
-    if (_currentlyPlayingPath == ringtone.path) {
-      await _audioPlayer.stop();
-      setState(() {
-        _currentlyPlayingPath = null;
-      });
-    }
-
-    try {
-      final result = await _audioService.deleteRingtone(ringtone.uri);
-
-      if (result) {
-        _loadRingtones();
-        if (mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(const SnackBar(content: Text('删除成功')));
-        }
-      } else {
-        if (mounted) {
-          ScaffoldMessenger.of(
-            context,
-          ).showSnackBar(const SnackBar(content: Text('删除失败: 无法删除文件')));
-        }
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('删除失败: $e')));
-      }
-    }
-  }
-
-  String _formatSize(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-  }
-
-  String _formatDuration(Duration duration) {
-    String twoDigits(int n) => n.toString().padLeft(2, '0');
-    final minutes = twoDigits(duration.inMinutes.remainder(60));
-    final seconds = twoDigits(duration.inSeconds.remainder(60));
-    return '$minutes:$seconds';
+  String _date(int timestamp) {
+    if (timestamp == 0) return '';
+    final date = DateTime.fromMillisecondsSinceEpoch(timestamp);
+    return '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
   }
 
   @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('我的铃声'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: _loadRingtones,
-            tooltip: '刷新',
-          ),
-        ],
-      ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : _ringtones.isEmpty
-          ? Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(Icons.music_off, size: 64, color: Colors.grey[400]),
-                  const SizedBox(height: 16),
-                  Text(
-                    '暂无铃声',
-                    style: TextStyle(fontSize: 18, color: Colors.grey[600]),
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(
+      title: const Text('我的铃声'),
+      actions: [
+        IconButton(
+          onPressed: _busy ? null : _load,
+          tooltip: '刷新',
+          icon: const Icon(Icons.refresh),
+        ),
+      ],
+    ),
+    body: Column(
+      children: [
+        if (_busy) const LinearProgressIndicator(minHeight: 2),
+        Expanded(
+          child: _loading
+              ? const Center(child: CircularProgressIndicator())
+              : _error != null
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(_error!, textAlign: TextAlign.center),
+                        TextButton(onPressed: _load, child: const Text('重试')),
+                      ],
+                    ),
                   ),
-                  const SizedBox(height: 8),
-                  Text(
-                    '导出的铃声会显示在这里',
-                    style: TextStyle(color: Colors.grey[500]),
+                )
+              : _items.isEmpty
+              ? Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(
+                        Icons.library_music_outlined,
+                        size: 42,
+                        color: Color(0xFFB7BBBD),
+                      ),
+                      const SizedBox(height: 20),
+                      const Text(
+                        '还没有铃声',
+                        style: TextStyle(
+                          fontSize: 21,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        '剪辑并保存后，会显示在这里',
+                        style: TextStyle(color: Colors.grey),
+                      ),
+                      const SizedBox(height: 24),
+                      TextButton(
+                        onPressed: () => Navigator.popUntil(
+                          context,
+                          (route) => route.isFirst,
+                        ),
+                        child: const Text('返回选择文件'),
+                      ),
+                    ],
                   ),
-                ],
-              ),
-            )
-          : RefreshIndicator(
-              onRefresh: _loadRingtones,
-              child: ListView.builder(
-                padding: const EdgeInsets.all(16),
-                itemCount: _ringtones.length,
-                itemBuilder: (context, index) {
-                  final ringtone = _ringtones[index];
-
-                  // FIX #4: 用单层 StreamBuilder 监听播放状态（仅控制图标高亮）
-                  // 进度条单独抽成 _AudioProgressBar，只有当前播放项才订阅 positionStream
-                  return StreamBuilder<PlayerState>(
-                    stream: _audioPlayer.playerStateStream,
-                    builder: (context, stateSnapshot) {
-                      final isPlaying = stateSnapshot.data?.playing ?? false;
-                      final isCurrentFile =
-                          _currentlyPlayingPath == ringtone.path;
-
-                      return Card(
-                        margin: const EdgeInsets.only(bottom: 12),
-                        child: Padding(
-                          padding: const EdgeInsets.all(16),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              // 文件名和播放按钮
-                              Row(
-                                children: [
-                                  GestureDetector(
-                                    onTap: () => _togglePlay(ringtone.path),
-                                    child: Padding(
-                                      padding: const EdgeInsets.all(4),
+                )
+              : RefreshIndicator(
+                  onRefresh: _load,
+                  child: ListView.separated(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                    itemCount: _items.length,
+                    separatorBuilder: (_, _) =>
+                        const Divider(height: 1, indent: 64),
+                    itemBuilder: (context, index) {
+                      final item = _items[index],
+                          current = item.uri == _current;
+                      final playing =
+                          current &&
+                          _player.playing &&
+                          _player.processingState != ProcessingState.completed;
+                      return Container(
+                        decoration: BoxDecoration(
+                          color: item.uri == widget.highlightUri
+                              ? editorGreen.withValues(alpha: .07)
+                              : null,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        padding: const EdgeInsets.symmetric(
+                          vertical: 12,
+                          horizontal: 4,
+                        ),
+                        child: Column(
+                          children: [
+                            Row(
+                              children: [
+                                Material(
+                                  color: current ? editorGreen : Colors.white,
+                                  shape: const CircleBorder(),
+                                  child: InkWell(
+                                    onTap: _busy
+                                        ? null
+                                        : () => _toggle(item.uri),
+                                    customBorder: const CircleBorder(),
+                                    child: SizedBox(
+                                      width: 44,
+                                      height: 44,
                                       child: Icon(
-                                        isCurrentFile && isPlaying
-                                            ? Icons.pause_circle
-                                            : Icons.play_circle_outline,
-                                        color: isCurrentFile
-                                            ? Colors.green
-                                            : Theme.of(
-                                                context,
-                                              ).colorScheme.primary,
-                                        size: 28,
+                                        playing
+                                            ? Icons.pause
+                                            : Icons.play_arrow,
+                                        color: current
+                                            ? Colors.white
+                                            : Colors.black,
                                       ),
                                     ),
                                   ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: GestureDetector(
-                                      onTap: () => _togglePlay(ringtone.path),
-                                      onLongPress: () =>
-                                          _renameFile(ringtone),
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(
-                                          vertical: 4,
-                                        ),
-                                        child: Column(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            Row(
-                                              children: [
-                                                Expanded(
-                                                  child: Text(
-                                                    ringtone.name,
-                                                    style: TextStyle(
-                                                      fontWeight:
-                                                          FontWeight.w500,
-                                                      color: isCurrentFile
-                                                          ? Colors.green
-                                                          : null,
-                                                    ),
-                                                    overflow:
-                                                        TextOverflow.ellipsis,
-                                                  ),
-                                                ),
-                                                GestureDetector(
-                                                  onTap: () =>
-                                                      _showRingtoneTypeDialog(
-                                                        ringtone,
-                                                      ),
-                                                  child: Padding(
-                                                    padding:
-                                                        const EdgeInsets.only(
-                                                          left: 8,
-                                                        ),
-                                                    child: Icon(
-                                                      Icons
-                                                          .notifications_active,
-                                                      color: Colors.orange,
-                                                      size: 20,
-                                                    ),
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                            const SizedBox(height: 4),
-                                            Row(
-                                              children: [
-                                                Icon(
-                                                  Icons.timer_outlined,
-                                                  size: 14,
-                                                  color: Colors.grey[600],
-                                                ),
-                                                const SizedBox(width: 4),
-                                                Text(
-                                                  _formatDuration(
-                                                    ringtone.duration,
-                                                  ),
-                                                  style: TextStyle(
-                                                    color: Colors.grey[600],
-                                                    fontSize: 13,
-                                                  ),
-                                                ),
-                                                const SizedBox(width: 12),
-                                                Icon(
-                                                  Icons.storage_outlined,
-                                                  size: 14,
-                                                  color: Colors.grey[600],
-                                                ),
-                                                const SizedBox(width: 4),
-                                                Text(
-                                                  _formatSize(ringtone.size),
-                                                  style: TextStyle(
-                                                    color: Colors.grey[600],
-                                                    fontSize: 13,
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-
-                              // FIX #4: 进度条抽成独立 Widget，只有当前播放项才渲染并订阅 stream
-                              if (isCurrentFile)
-                                _AudioProgressBar(
-                                  audioPlayer: _audioPlayer,
-                                  fallbackDuration: ringtone.duration,
-                                  onSeek: _seekTo,
-                                  formatDuration: _formatDuration,
                                 ),
-
-                              const SizedBox(height: 8),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.end,
-                                children: [
-                                  TextButton.icon(
-                                    onPressed: () => _openFile(ringtone.path),
-                                    icon: const Icon(
-                                      Icons.open_in_new,
-                                      size: 18,
-                                    ),
-                                    label: const Text('打开'),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  TextButton.icon(
-                                    onPressed: () => _shareFile(ringtone.path),
-                                    icon: const Icon(Icons.share, size: 18),
-                                    label: const Text('分享'),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  TextButton.icon(
-                                    onPressed: () => _deleteFile(ringtone),
-                                    icon: Icon(
-                                      Icons.delete_outline,
-                                      size: 18,
-                                      color: Colors.red[400],
-                                    ),
-                                    label: Text(
-                                      '删除',
-                                      style: TextStyle(
-                                        color: Colors.red[400],
+                                const SizedBox(width: 16),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      TailFilename(
+                                        name: item.name,
+                                        textAlign: TextAlign.left,
+                                        style: const TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.w500,
+                                        ),
                                       ),
-                                    ),
+                                      const SizedBox(height: 5),
+                                      Text(
+                                        '${displayTime(item.duration)}${item.createdAt == 0 ? '' : ' · ${_date(item.createdAt)}'}',
+                                        style: const TextStyle(
+                                          fontSize: 12,
+                                          color: Color(0xFF8B8F92),
+                                        ),
+                                      ),
+                                    ],
                                   ),
-                                ],
+                                ),
+                                PopupMenuButton<String>(
+                                  enabled: !_busy,
+                                  tooltip: '更多操作',
+                                  icon: const Icon(Icons.more_horiz),
+                                  onSelected: (action) => _action(item, action),
+                                  itemBuilder: (_) => const [
+                                    PopupMenuItem(
+                                      value: 'ringtone',
+                                      child: Text('设为铃声'),
+                                    ),
+                                    PopupMenuItem(
+                                      value: 'share',
+                                      child: Text('分享'),
+                                    ),
+                                    PopupMenuItem(
+                                      value: 'rename',
+                                      child: Text('重命名'),
+                                    ),
+                                    PopupMenuItem(
+                                      value: 'delete',
+                                      child: Text('删除'),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                            if (current)
+                              StreamBuilder<Duration>(
+                                stream: _player.positionStream,
+                                builder: (context, snapshot) {
+                                  final max =
+                                      _player.duration?.inMilliseconds ??
+                                      (item.duration > 0 ? item.duration : 1);
+                                  return Slider(
+                                    value: (snapshot.data?.inMilliseconds ?? 0)
+                                        .clamp(0, max)
+                                        .toDouble(),
+                                    max: max.toDouble(),
+                                    onChanged: _busy
+                                        ? null
+                                        : (v) => _player.seek(
+                                            Duration(milliseconds: v.round()),
+                                          ),
+                                  );
+                                },
                               ),
-                            ],
-                          ),
+                          ],
                         ),
                       );
                     },
-                  );
-                },
-              ),
-            ),
-    );
-  }
-}
-
-/// FIX #4: 独立的进度条 Widget
-/// 只在当前播放的 item 上渲染，避免所有列表项都订阅 positionStream
-class _AudioProgressBar extends StatelessWidget {
-  final AudioPlayer audioPlayer;
-  final Duration fallbackDuration;
-  final ValueChanged<Duration> onSeek;
-  final String Function(Duration) formatDuration;
-
-  const _AudioProgressBar({
-    required this.audioPlayer,
-    required this.fallbackDuration,
-    required this.onSeek,
-    required this.formatDuration,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<Duration>(
-      stream: audioPlayer.positionStream,
-      builder: (context, positionSnapshot) {
-        final position = positionSnapshot.data ?? Duration.zero;
-
-        return StreamBuilder<Duration?>(
-          stream: audioPlayer.durationStream,
-          builder: (context, durationSnapshot) {
-            final duration = durationSnapshot.data ?? fallbackDuration;
-
-            return Padding(
-              padding: const EdgeInsets.only(top: 12),
-              child: Row(
-                children: [
-                  Text(
-                    formatDuration(position),
-                    style: TextStyle(fontSize: 12, color: Colors.grey[600]),
                   ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: SliderTheme(
-                      data: SliderTheme.of(context).copyWith(
-                        trackHeight: 4,
-                        thumbShape: const RoundSliderThumbShape(
-                          enabledThumbRadius: 6,
-                        ),
-                        overlayShape: const RoundSliderOverlayShape(
-                          overlayRadius: 12,
-                        ),
-                      ),
-                      child: Slider(
-                        value: position.inMilliseconds
-                            .toDouble()
-                            .clamp(0, duration.inMilliseconds.toDouble()),
-                        min: 0,
-                        max: duration.inMilliseconds.toDouble(),
-                        divisions: duration.inMilliseconds > 0
-                            ? (duration.inMilliseconds ~/ 100).clamp(1, 100)
-                            : 1,
-                        activeColor: Colors.green,
-                        inactiveColor: Colors.grey[300],
-                        onChanged: (value) {
-                          onSeek(Duration(milliseconds: value.round()));
-                        },
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Text(
-                    formatDuration(duration),
-                    style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-                  ),
-                ],
-              ),
-            );
-          },
-        );
-      },
-    );
-  }
-}
-
-class RingtoneFile {
-  final String uri; // content:// URI for MediaStore
-  final String path; // 实际文件路径
-  final String name;
-  final int size;
-  final Duration duration;
-
-  RingtoneFile({
-    required this.uri,
-    required this.path,
-    required this.name,
-    required this.size,
-    required this.duration,
-  });
+                ),
+        ),
+      ],
+    ),
+  );
 }
