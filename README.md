@@ -2,6 +2,25 @@
 
 面向 Android 8.0 及以上的轻量音频、视频铃声制作工具。
 
+## 界面预览
+
+从音频或视频中选取片段，查看清晰波形、微调起止位置，再保存为铃声。以下为应用在 realme 手机上运行时的实际界面。
+
+<table>
+  <tr>
+    <td align="center"><b>选择音视频</b></td>
+    <td align="center"><b>波形裁剪</b></td>
+    <td align="center"><b>关于与反馈</b></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/home.png" alt="铃声制作首页" width="260"></td>
+    <td><img src="docs/screenshots/editor.png" alt="双波形铃声裁剪界面" width="260"></td>
+    <td><img src="docs/screenshots/about.png" alt="关于页面和反馈方式" width="260"></td>
+  </tr>
+</table>
+
+**裁剪操作：** 拖动上下波形的边界选择片段，播放头固定在中央；播放试听后，保存选中内容。
+
 ## 裁切界面
 
 - 上方为可左右拖动、双指缩放的大波形。绿色播放头始终位于正中间，波形在它下面移动。
